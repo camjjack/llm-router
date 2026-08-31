@@ -139,3 +139,25 @@ def test_shipped_example_config_is_valid():
     assert {b.kind for b in config.backends} == {
         "ninfer", "llamacpp", "vllm", "lmstudio"
     }
+
+
+def test_model_aliases(tmp_path):
+    config = load_config(write(tmp_path, """
+model_aliases:
+  claude-sonnet-4-5: qwen
+  "*": qwen
+backends:
+  - {name: a, url: "http://h", capacity: 1, models: [qwen]}
+"""))
+    assert config.model_aliases == {"claude-sonnet-4-5": "qwen", "*": "qwen"}
+
+
+def test_alias_to_unknown_model_is_rejected(tmp_path):
+    """A typo here would surface as a 404 mid-session, not at startup."""
+    with pytest.raises(ConfigError, match="which no backend serves"):
+        load_config(write(tmp_path, """
+model_aliases:
+  claude-sonnet-4-5: typo-model
+backends:
+  - {name: a, url: "http://h", capacity: 1, models: [qwen]}
+"""))

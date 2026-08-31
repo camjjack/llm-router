@@ -34,6 +34,19 @@ health:
   timeout_s: 3
   failure_threshold: 2
 
+# Map requested model names onto configured ones. Claude Code sends whatever
+# ANTHROPIC_MODEL is set to, and *also* issues background requests for its
+# small/fast model (summarisation, commit messages). Without an entry for those,
+# that background traffic 404s. "*" is a catch-all for anything unmatched.
+#
+# Note: Claude Code's optional gateway model discovery only keeps model ids
+# containing "claude" or "anthropic", so if you want the /model picker populated,
+# alias a claude-ish name to your model and list it as a backend model.
+# model_aliases:
+#   claude-sonnet-4-5: qwen3.6-27b
+#   claude-haiku-4-5: qwen3.6-27b
+#   "*": qwen3.6-27b
+
 backends:
   # --- ninfer-windows hosts -------------------------------------------------
   # capacity MUST equal that host's --max-concurrency.

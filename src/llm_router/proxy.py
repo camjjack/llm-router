@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import time
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
 from starlette.applications import Starlette
@@ -14,11 +14,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .affinity import SessionMap, explicit_session_id, session_keys
+from . import surfaces
+from .affinity import SessionMap, explicit_session_id
 from .backend import BackendClients
 from .config import Config
 from .scheduler import Lease, NoBackendError, QueueTimeout, Scheduler
 from .stats import RouterStats
+from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface
 
 log = logging.getLogger("llm_router.proxy")
 
@@ -40,55 +42,12 @@ HOP_BY_HOP = {
     "host",
 }
 
-MAX_SSE_LINE_BYTES = 1 << 20
-
-
-def _error(status: int, message: str, type_: str = "invalid_request_error", code: str | None = None) -> JSONResponse:
-    payload: dict[str, Any] = {"message": message, "type": type_}
-    if code:
-        payload["code"] = code
-    return JSONResponse({"error": payload}, status_code=status)
-
-
-class _StreamTap:
-    """Scans a pass-through SSE stream for the terminal `usage` object.
-
-    The bytes are forwarded untouched; this only observes them, so we can report
-    prefix-cache hit rates without altering what the client receives.
-    """
-
-    def __init__(self) -> None:
-        self._buffer = b""
-        self.usage: dict | None = None
-        self.chunks = 0
-
-    def feed(self, chunk: bytes) -> None:
-        self.chunks += 1
-        if b"usage" not in chunk and b"usage" not in self._buffer:
-            # Fast path: keep only a short tail in case a line straddles chunks.
-            self._buffer = (self._buffer + chunk)[-256:]
-            return
-
-        self._buffer += chunk
-        if len(self._buffer) > MAX_SSE_LINE_BYTES:
-            self._buffer = self._buffer[-MAX_SSE_LINE_BYTES:]
-
-        lines = self._buffer.split(b"\n")
-        self._buffer = lines.pop()
-        for line in lines:
-            line = line.strip()
-            if not line.startswith(b"data:") or b'"usage"' not in line:
-                continue
-            payload = line[5:].strip()
-            if payload in (b"", b"[DONE]"):
-                continue
-            try:
-                data = json.loads(payload)
-            except ValueError:
-                continue
-            usage = data.get("usage") if isinstance(data, dict) else None
-            if isinstance(usage, dict):
-                self.usage = usage
+# Headers forwarded to the backend verbatim. The Claude Code gateway contract is
+# explicit that `anthropic-*` must be treated as an OPEN list: capabilities arrive
+# as new headers, and a gateway pinned to today's names breaks the release that
+# introduces the next one. The client's own credentials are deliberately not
+# forwarded -- each backend authenticates with its own configured key.
+FORWARDED_HEADER_PREFIXES = ("anthropic-",)
 
 
 class Router:
@@ -118,40 +77,75 @@ class Router:
     # ------------------------------------------------------------------ routing
 
     async def chat_completions(self, request: Request) -> Response:
+        return await self._handle(request, OPENAI)
+
+    async def messages(self, request: Request) -> Response:
+        """Anthropic Messages API -- what Claude Code speaks.
+
+        Note the route matches on path only: Claude Code posts inference requests
+        to `/v1/messages?beta=true`, and the query string is forwarded upstream
+        rather than matched on.
+        """
+        return await self._handle(request, ANTHROPIC)
+
+    def resolve_model(self, model: str) -> str:
+        """Apply configured aliases, falling back to a catch-all if one is set.
+
+        Claude Code sends whatever model name it was configured with, and also
+        issues background requests for its small/fast model. Without an alias for
+        those, the background traffic 404s.
+        """
+        aliases = self.config.model_aliases
+        if not aliases:
+            return model
+        return aliases.get(model) or aliases.get("*") or model
+
+    async def _handle(self, request: Request, surface: Surface) -> Response:
         try:
             body = await request.json()
         except (ValueError, UnicodeDecodeError):
-            return _error(400, "request body must be valid JSON")
+            return surface.error(400, "request body must be valid JSON", surfaces.BAD_REQUEST)
         if not isinstance(body, dict):
-            return _error(400, "request body must be a JSON object")
+            return surface.error(400, "request body must be a JSON object", surfaces.BAD_REQUEST)
 
-        model = body.get("model")
-        if not isinstance(model, str) or not model:
-            return _error(400, "'model' is required", code="model_required")
+        requested = body.get("model")
+        if not isinstance(requested, str) or not requested:
+            return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
+
+        model = self.resolve_model(requested)
         if not self.config.backends_for(model):
-            return _error(
+            return surface.error(
                 404,
-                f"model '{model}' is not served by any configured backend "
+                f"model '{requested}' is not served by any configured backend "
                 f"(known: {', '.join(self.config.all_models)})",
-                code="model_not_found",
+                surfaces.MODEL_NOT_FOUND,
             )
 
         streaming = bool(body.get("stream"))
         routing = self.config.routing
 
         explicit = explicit_session_id(body, request.headers)
-        keys = [explicit] if explicit else session_keys(body)
-        # session_id is ours, not part of the OpenAI schema; never forward it.
-        body.pop("session_id", None)
+        keys = [explicit] if explicit else surface.session_keys(body)
+        min_depth = 1 if explicit else surface.min_affinity_depth
+        if surface is OPENAI:
+            # `session_id` is ours, not part of the OpenAI schema; never forward it.
+            # The Anthropic body is passed through untouched, since capability
+            # headers pair with body fields and breaking a pair is a hard 400.
+            body.pop("session_id", None)
 
-        preferred = self.sessions.lookup(keys) if keys else None
+        preferred = self.sessions.lookup(keys, min_depth) if keys else None
         if keys:
             if preferred:
                 self.stats.affinity_hits += 1
             else:
                 self.stats.affinity_misses += 1
 
-        if streaming and routing.inject_usage and "stream_options" not in body:
+        if (
+            surface is OPENAI
+            and streaming
+            and routing.inject_usage
+            and "stream_options" not in body
+        ):
             body["stream_options"] = {"include_usage": True}
 
         excluded: set[str] = set()
@@ -171,26 +165,26 @@ class Router:
                 if last_error is not None:
                     return last_error
                 self.stats.rejected_no_backend += 1
-                return _error(
+                return surface.error(
                     503,
                     f"no healthy backend available for model '{model}'",
-                    type_="service_unavailable",
-                    code="no_backend_available",
+                    surfaces.NO_BACKEND,
                 )
             except QueueTimeout:
                 self.stats.queue_timeouts += 1
-                return _error(
+                return surface.error(
                     503,
                     f"timed out waiting {routing.queue_timeout_s:.0f}s for a free slot",
-                    type_="service_unavailable",
-                    code="queue_timeout",
+                    surfaces.QUEUE_TIMEOUT,
                 )
 
             self._record_lease(lease, pinned=preferred is not None)
             if attempt:
                 self.stats.retries += 1
 
-            outcome, response = await self._dispatch(lease, body, streaming, keys)
+            outcome, response = await self._dispatch(
+                lease, body, streaming, keys, surface, request, min_depth, model
+            )
             if outcome == "ok":
                 return response
             # Retryable: the lease is already released. Try elsewhere.
@@ -198,8 +192,72 @@ class Router:
             excluded.add(lease.name)
             preferred = None
 
-        return last_error or _error(
-            502, "all backends failed", type_="service_unavailable"
+        return last_error or surface.error(502, "all backends failed", surfaces.ALL_FAILED)
+
+    async def count_tokens(self, request: Request) -> Response:
+        """Anthropic token counting.
+
+        Deliberately does not take a capacity slot: it is a cheap, non-generating
+        call, and holding a generation slot for it would let Claude Code's
+        bookkeeping block real work. It still prefers the session's pinned host,
+        but never creates a pin of its own.
+        """
+        surface = ANTHROPIC
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return surface.error(400, "request body must be valid JSON", surfaces.BAD_REQUEST)
+        if not isinstance(body, dict):
+            return surface.error(400, "request body must be a JSON object", surfaces.BAD_REQUEST)
+
+        requested = body.get("model")
+        if not isinstance(requested, str) or not requested:
+            return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
+        model = self.resolve_model(requested)
+
+        candidates = [
+            b
+            for b in self.config.backends_for(model)
+            if self.scheduler.backends[b.name].healthy
+        ]
+        if not candidates:
+            return surface.error(
+                503,
+                f"no healthy backend available for model '{model}'",
+                surfaces.NO_BACKEND,
+            )
+
+        keys = surface.session_keys(body)
+        pinned = self.sessions.lookup(keys, surface.min_affinity_depth) if keys else None
+        backend = next((b for b in candidates if b.name == pinned), None) or min(
+            candidates, key=lambda b: self.scheduler.backends[b.name].inflight
+        )
+
+        payload = dict(body)
+        if backend.upstream_model:
+            payload["model"] = backend.upstream_model
+        else:
+            payload["model"] = model
+
+        headers = self._upstream_headers(backend, request, streaming=False)
+        try:
+            upstream = await self.clients.client(backend.name).post(
+                "/v1/messages/count_tokens",
+                json=payload,
+                headers=headers,
+                params=dict(request.query_params),
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            return surface.error(
+                502,
+                f"backend '{backend.name}' unreachable: {exc}",
+                surfaces.UNREACHABLE,
+            )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+            headers={"x-llm-router-backend": backend.name},
         )
 
     def _record_lease(self, lease: Lease, pinned: bool) -> None:
@@ -219,28 +277,60 @@ class Router:
 
     # ---------------------------------------------------------------- dispatch
 
+    def _upstream_headers(self, backend, request: Request, streaming: bool) -> dict:
+        """Headers for the upstream call.
+
+        The client's credentials are consumed, not forwarded: each backend
+        authenticates with its own configured key. `anthropic-*` headers are
+        forwarded verbatim as an open list, because Claude Code capabilities pair
+        a beta header with body fields and dropping either half breaks them.
+        """
+        headers = self.clients.headers_for(backend)
+        headers["content-type"] = "application/json"
+        headers["accept"] = "text/event-stream" if streaming else "application/json"
+        for name, value in request.headers.items():
+            lowered = name.lower()
+            if lowered in HOP_BY_HOP:
+                continue
+            if lowered.startswith(FORWARDED_HEADER_PREFIXES):
+                headers[lowered] = value
+        return headers
+
     async def _dispatch(
-        self, lease: Lease, body: dict, streaming: bool, keys: list[str]
+        self,
+        lease: Lease,
+        body: dict,
+        streaming: bool,
+        keys: list[str],
+        surface: Surface,
+        request: Request,
+        min_depth: int,
+        model: str,
     ) -> tuple[str, Response]:
         backend = lease.backend.config
         client = self.clients.client(backend.name)
 
+        # The only body change is the model name, which a gateway is expected to
+        # rewrite -- an aliased name must not reach the backend. Everything else
+        # passes through untouched.
         payload = dict(body)
-        if backend.upstream_model:
-            payload["model"] = backend.upstream_model
+        payload["model"] = backend.upstream_model or model
 
-        headers = self.clients.headers_for(backend)
-        headers["content-type"] = "application/json"
-        headers["accept"] = "text/event-stream" if streaming else "application/json"
+        headers = self._upstream_headers(backend, request, streaming)
+        # Claude Code posts inference to /v1/messages?beta=true; forward the query
+        # string rather than matching on it.
+        params = dict(request.query_params)
 
         started = time.monotonic()
         try:
             if streaming:
                 return await self._dispatch_streaming(
-                    lease, client, headers, payload, keys, started
+                    lease, client, headers, payload, keys, started, surface,
+                    params, min_depth,
                 )
             return await self._dispatch_buffered(
-                lease, client, headers, payload, keys, started
+                lease, client, headers, payload, keys, started, surface,
+                params, min_depth,
             )
         except (httpx.HTTPError, OSError) as exc:
             lease.release()
@@ -249,11 +339,10 @@ class Router:
             log.warning("backend %s transport error: %r", backend.name, exc)
             return (
                 "retry",
-                _error(
+                surface.error(
                     502,
                     f"backend '{backend.name}' unreachable: {exc}",
-                    type_="service_unavailable",
-                    code="backend_unreachable",
+                    surfaces.UNREACHABLE,
                 ),
             )
 
@@ -265,16 +354,19 @@ class Router:
         payload: dict,
         keys: list[str],
         started: float,
+        surface: Surface,
+        params: dict,
+        min_depth: int,
     ) -> tuple[str, Response]:
         name = lease.name
         upstream = await client.post(
-            "/v1/chat/completions", json=payload, headers=headers
+            surface.path, json=payload, headers=headers, params=params
         )
 
         # Non-streaming: the slot is free the moment the body is in hand.
         if upstream.status_code != 200:
             lease.release()
-            return self._upstream_error(name, upstream.status_code, upstream.content)
+            return self._upstream_error(name, upstream.status_code, upstream.content, surface)
 
         lease.release()
         self.scheduler.note_success(name)
@@ -288,16 +380,14 @@ class Router:
             data = upstream.json()
         except ValueError:
             data = None
-        if isinstance(data, dict):
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                bstats.record_usage(usage)
-                completion = usage.get("completion_tokens")
-                if isinstance(completion, int) and completion > 0 and elapsed > 0:
-                    bstats.tokens_per_s.append(completion / elapsed)
+        usage = surface.usage_from_body(data)
+        if usage is not None:
+            bstats.record_usage(usage)
+            if usage.completion_tokens > 0 and elapsed > 0:
+                bstats.tokens_per_s.append(usage.completion_tokens / elapsed)
 
         if keys:
-            self.sessions.assign(keys, name)
+            self.sessions.assign(keys, name, min_depth)
 
         return ("ok", Response(
             content=upstream.content,
@@ -314,10 +404,13 @@ class Router:
         payload: dict,
         keys: list[str],
         started: float,
+        surface: Surface,
+        params: dict,
+        min_depth: int,
     ) -> tuple[str, Response]:
         name = lease.name
         request = client.build_request(
-            "POST", "/v1/chat/completions", json=payload, headers=headers
+            "POST", surface.path, json=payload, headers=headers, params=params
         )
         # send(stream=True) returns once headers are in, so we can still fail over
         # to another backend before any bytes reach the client.
@@ -327,14 +420,14 @@ class Router:
             content = await upstream.aread()
             await upstream.aclose()
             lease.release()
-            return self._upstream_error(name, upstream.status_code, content)
+            return self._upstream_error(name, upstream.status_code, content, surface)
 
         self.scheduler.note_success(name)
         if keys:
-            self.sessions.assign(keys, name)
+            self.sessions.assign(keys, name, min_depth)
 
         return ("ok", StreamingResponse(
-            self._stream_body(lease, upstream, started),
+            self._stream_body(lease, upstream, started, surface),
             status_code=200,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
             headers={
@@ -345,15 +438,18 @@ class Router:
         ))
 
     async def _stream_body(
-        self, lease: Lease, upstream: httpx.Response, started: float
-    ) -> AsyncIterator[bytes]:
+        self, lease: Lease, upstream: httpx.Response, started: float, surface: Surface
+    ):
         name = lease.name
         bstats = self.stats.backend(name)
-        tap = _StreamTap()
+        tap = StreamTap(surface)
         first_byte_at: float | None = None
         failed = False
 
         try:
+            # aiter_raw forwards bytes exactly as they arrive, including SSE ping
+            # events and comment lines. Claude Code counts every byte and aborts a
+            # stream that goes silent for 300s, so pings must not be filtered.
             async for chunk in upstream.aiter_raw():
                 if first_byte_at is None:
                     first_byte_at = time.monotonic()
@@ -366,8 +462,9 @@ class Router:
             log.warning("backend %s stream aborted: %r", name, exc)
             self.scheduler.note_failure(name)
         finally:
-            # Runs on normal completion, upstream error, and client disconnect alike.
-            # A leaked slot here is precisely the bug this router exists to avoid.
+            # Runs on normal completion, upstream error, and client disconnect
+            # alike. A leaked slot here is precisely the bug this router exists to
+            # avoid.
             await upstream.aclose()
             lease.release()
 
@@ -375,20 +472,16 @@ class Router:
                 bstats.errors += 1
             else:
                 bstats.completed += 1
-            if tap.usage:
-                bstats.record_usage(tap.usage)
-                completion = tap.usage.get("completion_tokens")
-                if (
-                    isinstance(completion, int)
-                    and completion > 0
-                    and first_byte_at is not None
-                ):
+            usage = tap.usage
+            if usage is not None:
+                bstats.record_usage(usage)
+                if usage.completion_tokens > 0 and first_byte_at is not None:
                     decode_s = time.monotonic() - first_byte_at
                     if decode_s > 0:
-                        bstats.tokens_per_s.append(completion / decode_s)
+                        bstats.tokens_per_s.append(usage.completion_tokens / decode_s)
 
     def _upstream_error(
-        self, name: str, status: int, content: bytes
+        self, name: str, status: int, content: bytes, surface: Surface
     ) -> tuple[str, Response]:
         bstats = self.stats.backend(name)
         code = None
@@ -397,12 +490,14 @@ class Router:
             if isinstance(parsed, dict):
                 err = parsed.get("error")
                 if isinstance(err, dict):
-                    code = err.get("code")
+                    # OpenAI puts the machine-readable tag in `code`; Anthropic
+                    # puts it in `type` (e.g. overloaded_error).
+                    code = err.get("code") or err.get("type")
         except ValueError:
             parsed = None
 
         retryable = status in RETRYABLE_STATUSES
-        if status == 429 or code == "server_overloaded":
+        if status in (429, 529) or code in ("server_overloaded", "overloaded_error"):
             # We gate on capacity, so the backend should never be full. If it is, our
             # configured capacity is too high or something else is sharing the host.
             bstats.overloaded += 1
@@ -420,11 +515,13 @@ class Router:
             # A 4xx is the client's fault; it says nothing about backend health.
             self.scheduler.note_success(name)
 
-        media = "application/json"
+        # The backend's error body is relayed byte-for-byte. Claude Code's
+        # capability-retry logic matches on the upstream's own error wording, so
+        # wrapping it in our envelope would break its recovery path.
         response = Response(
             content=content,
             status_code=status,
-            media_type=media,
+            media_type="application/json",
             headers={"x-llm-router-backend": name},
         )
         return ("retry" if retryable else "ok", response)
@@ -467,6 +564,8 @@ class Router:
                 "object": "model",
                 "created": now,
                 "owned_by": "llm-router",
+                # Claude Code's gateway model discovery reads id and display_name.
+                "display_name": model,
             }
             context = self.context_for(model)
             if context is not None:
@@ -479,6 +578,9 @@ class Router:
                 entry["meta"] = {"n_ctx": context}
             data.append(entry)
         return JSONResponse({"object": "list", "data": data})
+
+    async def hello(self, request: Request) -> Response:
+        return Response(status_code=200)
 
     async def health(self, request: Request) -> JSONResponse:
         healthy = [s.name for s in self.scheduler.backends.values() if s.healthy]
@@ -543,7 +645,13 @@ def create_app(config: Config, router: Router | None = None) -> Starlette:
     app = Starlette(
         routes=[
             Route("/v1/chat/completions", router.chat_completions, methods=["POST"]),
+            # Matches on path, so /v1/messages?beta=true lands here too.
+            Route("/v1/messages", router.messages, methods=["POST"]),
+            Route("/v1/messages/count_tokens", router.count_tokens, methods=["POST"]),
             Route("/v1/models", router.models, methods=["GET"]),
+            # Claude Code's connection-warming probe. Answering it keeps the log
+            # clean; it is best-effort and safe to reject, but cheap to serve.
+            Route("/api/hello", router.hello, methods=["GET", "HEAD"]),
             Route("/health", router.health, methods=["GET"]),
             Route("/stats", router.stats_endpoint, methods=["GET"]),
         ],

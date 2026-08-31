@@ -13,13 +13,20 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from typing import Any
 
-# Boundaries shallower than this are not used for pinning. Depth 1 is just the
-# system prompt, which every conversation from a given client shares -- pinning on
-# it would funnel every new session onto whichever backend served the last one.
-# Depth 2 includes the first user message, which is conversation-specific.
+# Boundaries shallower than this are not used for pinning. For OpenAI bodies,
+# depth 1 is just the system prompt, which every conversation from a given client
+# shares -- pinning on it would funnel every new session onto whichever backend
+# served the last one. Depth 2 includes the first user message, which is
+# conversation-specific.
 MIN_AFFINITY_DEPTH = 2
+
+# Anthropic carries the system prompt in a separate top-level field that is folded
+# into the root hash instead, so messages[0] is already the first user message and
+# depth 1 is safe to pin on.
+ANTHROPIC_MIN_AFFINITY_DEPTH = 1
 
 # Very large messages (pasted files, big tool outputs) are hashed head+tail+length
 # rather than in full, to bound per-request hashing cost. Collision risk is nil.
@@ -54,11 +61,15 @@ def _message_bytes(message: Any) -> bytes:
     return blob
 
 
-def session_keys(body: dict[str, Any]) -> list[str]:
-    """Cumulative prefix hashes for a chat-completions body, shallowest first.
+def session_keys(
+    body: dict[str, Any], root_fields: Sequence[str] = ("model", "tools")
+) -> list[str]:
+    """Cumulative prefix hashes for a request body, shallowest first.
 
-    The root folds in the model and tool definitions, since both participate in the
-    rendered prompt prefix that the backend actually caches.
+    The root folds in the fields that sit ahead of the messages in the rendered
+    prompt, since they are part of the prefix the backend caches. Which fields
+    those are differs by API: OpenAI carries the system prompt as messages[0],
+    while Anthropic has a separate top-level `system`.
     """
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -66,10 +77,7 @@ def session_keys(body: dict[str, Any]) -> list[str]:
 
     root = _digest(
         json.dumps(
-            {
-                "model": body.get("model"),
-                "tools": _canonical(body.get("tools")),
-            },
+            {field: _canonical(body.get(field)) for field in root_fields},
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -84,11 +92,28 @@ def session_keys(body: dict[str, Any]) -> list[str]:
 
 
 def explicit_session_id(body: dict[str, Any], headers: Any) -> str | None:
-    """An explicit session id, if the client is kind enough to supply one."""
-    header = None
+    """An exact conversation id, when the client supplies one.
+
+    Claude Code sends `x-claude-code-session-id` on every request, which beats
+    inferring identity from the prompt: it survives context compaction, where the
+    hashed prefix legitimately changes but the conversation has not.
+
+    A session may run several subagents concurrently, each with its own distinct
+    conversation. `x-claude-code-agent-id` separates them, so each gets its own
+    pin rather than piling every subagent onto one host.
+    """
     if headers is not None:
+        claude_session = headers.get("x-claude-code-session-id")
+        if claude_session:
+            agent = headers.get("x-claude-code-agent-id")
+            suffix = f"/{agent}" if agent else ""
+            return f"explicit:cc:{claude_session}{suffix}"
+
         header = headers.get("x-session-id") or headers.get("x-conversation-id")
-    value = header or body.get("session_id")
+        if header:
+            return f"explicit:{header}"
+
+    value = body.get("session_id")
     if value and isinstance(value, str):
         return f"explicit:{value}"
     return None
@@ -107,11 +132,11 @@ class SessionMap:
     def __len__(self) -> int:
         return len(self._entries)
 
-    def lookup(self, keys: list[str]) -> str | None:
+    def lookup(self, keys: list[str], min_depth: int = MIN_AFFINITY_DEPTH) -> str | None:
         """Longest-prefix match: the deepest known boundary wins."""
         now = time.monotonic()
         for index in range(len(keys) - 1, -1, -1):
-            if index + 1 < MIN_AFFINITY_DEPTH:
+            if index + 1 < min_depth:
                 break
             entry = self._entries.get(keys[index])
             if entry is None:
@@ -124,12 +149,14 @@ class SessionMap:
             return backend
         return None
 
-    def assign(self, keys: list[str], backend: str) -> None:
+    def assign(
+        self, keys: list[str], backend: str, min_depth: int = MIN_AFFINITY_DEPTH
+    ) -> None:
         """Record the deepest boundaries of this request against a backend."""
         if not keys:
             return
         expires_at = time.monotonic() + self._ttl
-        start = max(MIN_AFFINITY_DEPTH - 1, len(keys) - self._depth)
+        start = max(min_depth - 1, len(keys) - self._depth)
         for index in range(start, len(keys)):
             key = keys[index]
             self._entries[key] = (backend, expires_at)

@@ -75,6 +75,12 @@ class FakeUpstream:
     overload_responses: int = 0
     seen_prefixes: set[str] = field(default_factory=set)
     request_log: list[dict] = field(default_factory=list)
+    # Headers and bodies exactly as received, so forwarding rules can be asserted.
+    header_log: list[dict] = field(default_factory=list)
+    body_log: list[dict] = field(default_factory=list)
+    query_log: list[str] = field(default_factory=list)
+    # Emit an SSE ping mid-stream; Claude Code needs these relayed unfiltered.
+    emit_ping: bool = False
 
     _port: int = 0
     _server: uvicorn.Server | None = None
@@ -96,6 +102,8 @@ class FakeUpstream:
                 Route("/v1/models", self._models, methods=["GET"]),
                 Route("/api/v0/models", self._lmstudio_models, methods=["GET"]),
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
+                Route("/v1/messages", self._messages, methods=["POST"]),
+                Route("/v1/messages/count_tokens", self._count_tokens, methods=["POST"]),
             ]
         )
 
@@ -205,8 +213,114 @@ class FakeUpstream:
         self.seen_prefixes.update(hashes)
         return matched * TOKENS_PER_MESSAGE
 
+    async def _messages(self, request: Request):
+        """Anthropic Messages API, as ninfer/llama.cpp/vLLM/LM Studio all expose it."""
+        body = await request.json()
+        self.header_log.append({k.lower(): v for k, v in request.headers.items()})
+        self.body_log.append(body)
+        self.query_log.append(str(request.url.query))
+
+        if self.fail_with is not None:
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "api_error", "message": "forced failure"}},
+                status_code=self.fail_with,
+            )
+
+        if self.outstanding >= self.max_concurrency + self.max_pending:
+            self.overload_responses += 1
+            # Anthropic's overload status.
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "overloaded_error", "message": "overloaded"}},
+                status_code=529,
+            )
+
+        self.outstanding += 1
+        messages = body.get("messages") or []
+        cached = self._cached_tokens(messages)
+        # Anthropic's input_tokens EXCLUDES the cached portion.
+        fresh = max(1, len(messages) * TOKENS_PER_MESSAGE - cached)
+        self.total_requests += 1
+        self.request_log.append(
+            {"messages": len(messages), "cached_tokens": cached,
+             "stream": bool(body.get("stream")), "body_keys": sorted(body)}
+        )
+
+        if body.get("stream"):
+            return StreamingResponse(
+                self._stream_anthropic(fresh, cached), media_type="text/event-stream"
+            )
+        async with self._slot():
+            await asyncio.sleep(self.latency_s)
+            return JSONResponse({
+                "id": "msg_fake",
+                "type": "message",
+                "role": "assistant",
+                "model": self.model,
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": fresh,
+                    "cache_read_input_tokens": cached,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": self.chunks,
+                },
+            })
+
+    async def _stream_anthropic(self, fresh: int, cached: int):
+        async with self._slot():
+            def sse(event: str, data: dict) -> bytes:
+                return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+            # The input side of usage arrives here...
+            yield sse("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_fake", "type": "message", "role": "assistant",
+                    "model": self.model, "content": [],
+                    "usage": {
+                        "input_tokens": fresh,
+                        "cache_read_input_tokens": cached,
+                        "cache_creation_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                },
+            })
+            yield sse("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            for i in range(self.chunks):
+                await asyncio.sleep(self.latency_s / max(1, self.chunks))
+                if self.emit_ping and i == 1:
+                    # Keep-alive traffic during a thinking pause. Claude Code
+                    # aborts a stream that goes silent, so this must be relayed.
+                    yield b"event: ping\ndata: {\"type\": \"ping\"}\n\n"
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": f"t{i}"},
+                })
+            yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            # ...and the output side only here.
+            yield sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": self.chunks},
+            })
+            yield sse("message_stop", {"type": "message_stop"})
+
+    async def _count_tokens(self, request: Request) -> JSONResponse:
+        body = await request.json()
+        self.header_log.append({k.lower(): v for k, v in request.headers.items()})
+        messages = body.get("messages") or []
+        return JSONResponse({"input_tokens": len(messages) * TOKENS_PER_MESSAGE})
+
     async def _chat(self, request: Request):
         body = await request.json()
+        self.header_log.append({k.lower(): v for k, v in request.headers.items()})
+        self.body_log.append(body)
+        self.query_log.append(str(request.url.query))
 
         if self.fail_with is not None:
             return JSONResponse(

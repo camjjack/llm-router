@@ -125,6 +125,11 @@ class TimeoutConfig:
 @dataclass(frozen=True)
 class Config:
     backends: tuple[BackendConfig, ...]
+    # Maps a requested model name onto a configured one. A "*" key is a catch-all
+    # for anything unmatched. Claude Code sends whatever model name it was given
+    # and issues background requests for its own small/fast model, so without an
+    # alias that background traffic 404s.
+    model_aliases: dict[str, str] = field(default_factory=dict)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
@@ -137,11 +142,15 @@ class Config:
 
     @property
     def all_models(self) -> tuple[str, ...]:
-        seen: dict[str, None] = {}
-        for b in self.backends:
-            for m in b.models:
-                seen.setdefault(m, None)
-        return tuple(seen)
+        return all_model_names(self.backends)
+
+
+def all_model_names(backends: tuple[BackendConfig, ...]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for backend in backends:
+        for model in backend.models:
+            seen.setdefault(model, None)
+    return tuple(seen)
 
 
 def _expand(value: Any) -> Any:
@@ -259,8 +268,21 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(listen, dict):
         raise ConfigError("'listen' must be a mapping with host/port")
 
+    aliases_raw = raw.get("model_aliases") or {}
+    if not isinstance(aliases_raw, dict):
+        raise ConfigError("'model_aliases' must be a mapping of name -> model")
+    model_aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+    known = set(all_model_names(backends))
+    for alias, target in model_aliases.items():
+        if target not in known:
+            raise ConfigError(
+                f"model_aliases['{alias}'] points at '{target}', which no backend "
+                f"serves (known: {', '.join(sorted(known))})"
+            )
+
     return Config(
         backends=backends,
+        model_aliases=model_aliases,
         routing=_section(raw, "routing", RoutingConfig),
         health=_section(raw, "health", HealthConfig),
         timeouts=_section(raw, "timeouts", TimeoutConfig),

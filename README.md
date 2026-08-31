@@ -8,8 +8,16 @@ A load-balancing proxy for local LLM backends that does two things ordinary rout
 2. **It keeps a conversation on one host.** Agentic loops resend the whole conversation every turn,
    so staying put turns a full prefill into a prompt-cache hit.
 
-Speaks the OpenAI chat-completions API. Routes to **ninfer-windows**, **llama.cpp**, **vLLM** and
+Speaks both the **OpenAI chat-completions** API and the **Anthropic Messages** API, so opencode and
+Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.cpp**, **vLLM** and
 **LM Studio** backends, including a mix of engines serving the same model.
+
+| Endpoint | For |
+|---|---|
+| `POST /v1/chat/completions` | opencode, aider, Cline, Continue, Zed |
+| `POST /v1/messages` | Claude Code (also `?beta=true`) |
+| `POST /v1/messages/count_tokens` | Claude Code token accounting |
+| `GET /v1/models`, `GET /health`, `GET /stats` | discovery, liveness, telemetry |
 
 | `kind` | Liveness | Load telemetry | Context from | Capacity should match |
 |---|---|---|---|---|
@@ -144,6 +152,66 @@ custom ones — it does **not** read them from `/v1/models`. So set them explici
   }
 }
 ```
+
+## Claude Code
+
+All four backend engines implement the Anthropic Messages API natively, so this is a passthrough —
+no translation layer, and none of the fidelity loss one would bring.
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN=local        # any non-empty value; the router ignores it
+export ANTHROPIC_MODEL=qwen3.6-27b
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.6-27b   # background traffic, else it 404s
+claude
+```
+
+Rather than setting the haiku variable, you can add a `"*"` entry to `model_aliases` and let the
+router absorb any model name Claude Code asks for.
+
+The router follows Anthropic's published gateway contract:
+
+- **`anthropic-*` headers are forwarded as an open list**, not an allowlist. Capabilities arrive as
+  new beta headers each release; a gateway pinned to today's names breaks the release that adds one.
+- **The request body is never modified** except the model name, which a gateway is expected to
+  rewrite. Capability betas pair a header with a body field, and breaking a pair is a hard `400`.
+  The `system` array in particular passes through untouched and still first, so Claude Code's
+  attribution block keeps being stripped positionally rather than polluting the prompt cache key.
+- **Upstream error bodies are relayed byte-for-byte.** Claude Code recovers from capability
+  rejections by matching on the upstream's own error wording, so wrapping errors in a router
+  envelope would break that recovery path.
+- **Streams are never buffered, and `ping` events are relayed.** Claude Code counts every byte and
+  aborts a stream silent for 300s; during a long thinking pause pings are the only traffic.
+- `/v1/messages/count_tokens` is served **without taking a capacity slot** — it is a cheap,
+  non-generating call, and holding a generation slot for bookkeeping would let it block real work.
+
+Two things worth knowing. Claude Code's system prompt and tool definitions are large, so give it a
+model with **at least ~25k context**; check what the router advertises with `curl
+localhost:8080/v1/models`. And its optional model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`)
+only keeps model ids containing `claude` or `anthropic`, so `qwen3.6-27b` will not appear in the
+`/model` picker unless you alias a claude-ish name to it.
+
+### Affinity is exact for Claude Code
+
+Claude Code sends `x-claude-code-session-id` on every request, so its conversations don't need to be
+inferred at all — the router pins on that id directly. That is strictly better than hashing the
+prompt: it survives **context compaction**, where the prefix legitimately changes but the session has
+not, and it costs nothing to compute. When a session runs subagents, `x-claude-code-agent-id`
+separates them so each holds its own pin rather than every subagent piling onto one host.
+
+Prompt-prefix hashing remains the fallback for clients that send no such header.
+
+### Affinity on the OpenAI surface
+
+On the OpenAI surface the system prompt is `messages[0]`, shared by every conversation from a
+client, so pinning ignores the first message boundary. Anthropic puts the system prompt in a
+separate top-level field, which is folded into the root hash instead — so `messages[0]` is already
+the first *user* message, unique to the conversation, and a Claude Code session can be pinned from
+its very first turn rather than its second.
+
+Cache-hit accounting is normalised across the two: Anthropic's `input_tokens` *excludes* cached
+tokens while OpenAI's `prompt_tokens` includes them, so the surfaces reconcile that before it
+reaches the dashboard and the `cache` column means the same thing either way.
 
 ## Configure your backends to match
 

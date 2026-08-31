@@ -11,6 +11,21 @@ def _mean(values: deque[float]) -> float | None:
     return (sum(values) / len(values)) if values else None
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    """Token counts normalised across API surfaces.
+
+    `prompt_tokens` is the complete prompt including any cached portion, and
+    `cached_tokens` is the part served from a prefix cache. OpenAI reports it that
+    way already; Anthropic splits the prompt across input/cache-read/cache-write,
+    so its surface sums them.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+
+
 @dataclass
 class BackendStats:
     """Lifetime counters and recent-performance windows for one backend."""
@@ -33,12 +48,18 @@ class BackendStats:
     # Per-request cache hit ratios, so a few huge prompts cannot dominate the average.
     cache_ratios: deque[float] = field(default_factory=lambda: deque(maxlen=64))
 
-    def record_usage(self, usage: dict) -> None:
-        """Absorb an OpenAI `usage` object, tolerating missing or odd fields."""
-        prompt = usage.get("prompt_tokens")
-        completion = usage.get("completion_tokens")
-        details = usage.get("prompt_tokens_details") or {}
-        cached = details.get("cached_tokens", 0)
+    def record_usage(self, usage: "TokenUsage | None") -> None:
+        """Absorb one request's token counts, tolerating missing or odd values.
+
+        Takes already-normalised counts: OpenAI and Anthropic disagree about
+        whether cached tokens are included in the prompt total, so the surfaces
+        reconcile that before it reaches here.
+        """
+        if usage is None:
+            return
+        prompt = usage.prompt_tokens
+        completion = usage.completion_tokens
+        cached = usage.cached_tokens
 
         if not isinstance(prompt, int) or prompt < 0:
             return
