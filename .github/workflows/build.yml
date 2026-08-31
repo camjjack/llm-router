@@ -7,12 +7,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Virtualenvs live in RUNNER_TEMP, never in the workspace: a venv inside the
-# checkout gets swept into the sdist, and its absolute `bin/python` symlink makes
-# the build fail with AbsoluteLinkError.
-env:
-  BUILD_VENV: ${{ runner.temp }}/build-venv
-  TEST_VENV: ${{ runner.temp }}/test-venv
+# Virtualenvs are created under $RUNNER_TEMP, never in the workspace: a venv
+# inside the checkout gets swept into the sdist, and its absolute `bin/python`
+# symlink makes the build fail with AbsoluteLinkError.
+#
+# $RUNNER_TEMP is a default runner environment variable rather than an expression,
+# because the `runner` context is not available in workflow- or job-level `env`.
 
 jobs:
   wheel:
@@ -40,15 +40,15 @@ jobs:
         # 24.04 marks the system interpreter externally-managed (PEP 668), so
         # `pip install` against it is refused. A venv is the supported route.
         run: |
-          python3 -m venv "$BUILD_VENV"
-          "$BUILD_VENV/bin/python" -m pip install --upgrade pip build
+          python3 -m venv "$RUNNER_TEMP/build-venv"
+          "$RUNNER_TEMP/build-venv/bin/python" -m pip install --upgrade pip build
 
       - name: Build sdist and wheel
         # `build` produces the sdist first, then builds the wheel *from* it. That
         # is the stronger check: a file missing from the sdist fails here rather
         # than surfacing for whoever installs from PyPI.
         run: |
-          "$BUILD_VENV/bin/python" -m build --outdir dist
+          "$RUNNER_TEMP/build-venv/bin/python" -m build --outdir dist
 
       - name: Inspect artifacts
         run: |
@@ -73,13 +73,13 @@ jobs:
         run: |
           shopt -s nullglob
           wheels=(dist/*.whl)
-          python3 -m venv "$TEST_VENV"
-          "$TEST_VENV/bin/python" -m pip install --upgrade pip
-          "$TEST_VENV/bin/python" -m pip install "${wheels[0]}" pytest pytest-asyncio
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          "$RUNNER_TEMP/test-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/test-venv/bin/python" -m pip install "${wheels[0]}" pytest pytest-asyncio
 
       - name: Verify the import resolves to the installed package
         run: |
-          "$TEST_VENV/bin/python" - <<'PY'
+          "$RUNNER_TEMP/test-venv/bin/python" - <<'PY'
           import llm_router
           path = llm_router.__file__
           assert "site-packages" in path, f"imported from the source tree, not the wheel: {path}"
@@ -88,11 +88,11 @@ jobs:
 
       - name: Smoke-test the console script
         run: |
-          "$TEST_VENV/bin/llm-router" check -c config.example.yaml
+          "$RUNNER_TEMP/test-venv/bin/llm-router" check -c config.example.yaml
 
       - name: Run the test suite against the installed wheel
         run: |
-          "$TEST_VENV/bin/python" -m pytest -q
+          "$RUNNER_TEMP/test-venv/bin/python" -m pytest -q
 
       - uses: actions/upload-artifact@v7
         with:
