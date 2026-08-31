@@ -325,8 +325,28 @@ every platform. There is nothing 3.12- or Linux-specific about the artifact — 
 pins where it is *verified*.
 
 CI installs the built wheel into a clean venv and runs the suite against **that**, not the checkout,
-so a module missing from the wheel fails the build instead of reaching whoever installs it. The
-`dist/` contents are uploaded as the `llm-router-dist` artifact.
+so a module missing from the wheel fails the build instead of reaching whoever installs it.
+
+### Getting the wheel
+
+Every build uploads `dist/` as the `llm-router-dist` artifact, but **Actions artifacts require a
+GitHub login to download** — even on a public repo, and even though the artifact's metadata is
+publicly visible. The ZIP endpoint returns `401` to anonymous callers. That is GitHub's behaviour,
+not something a workflow can change.
+
+For a link anyone can `curl`, push a version tag. That runs the release job, which attaches the
+wheel and sdist to a GitHub Release, and **release assets are anonymous-downloadable**:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+```bash
+pip install https://github.com/camjjack/llm-router/releases/download/v0.1.0/llm_router-0.1.0-py3-none-any.whl
+```
+
+The release step is idempotent: re-running a tag build repairs a partial release rather than failing
+because it already exists.
 
 The suite runs against a fake upstream that enforces its own concurrency limit and records the
 high-water mark of simultaneous requests, so oversubscription is caught rather than assumed. It also
