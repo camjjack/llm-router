@@ -1,0 +1,108 @@
+# llm-router configuration.
+#
+# Copy to config.yaml and edit. Validate with:  uv run llm-router check -c config.yaml
+
+listen:
+  host: 0.0.0.0
+  port: 8080
+
+routing:
+  # How long a request holds out for its pinned backend before spilling to the
+  # least-loaded host. For a long agentic loop a short wait usually beats
+  # re-prefilling the whole conversation on a cold host.
+  affinity_wait_ms: 1500
+  # How long a session -> backend pin survives without use.
+  session_ttl_s: 1800
+  # How long a request may sit in the proxy's queue before giving up (503).
+  # This is ordinary backpressure: the hosts are up, just busy.
+  queue_timeout_s: 300
+  # How long to wait when *no* backend for the model is up at all. Kept short --
+  # unlike a busy pool, there is nothing to wait for -- but non-zero so a restart
+  # or a blip that clears within a probe cycle or two rides through.
+  unavailable_grace_s: 10
+  # Failover attempts on a *different* backend. Only ever applied before the first
+  # byte has reached the client.
+  max_retries: 2
+  # Add stream_options.include_usage when the client omitted it. Off by default,
+  # since it appends a chunk the client did not ask for. Clients built on the
+  # Vercel AI SDK (opencode, and most others) already request usage themselves,
+  # which is what feeds the cache-hit column in the dashboard.
+  inject_usage: false
+
+health:
+  interval_s: 5
+  timeout_s: 3
+  failure_threshold: 2
+
+backends:
+  # --- ninfer-windows hosts -------------------------------------------------
+  # capacity MUST equal that host's --max-concurrency.
+  #
+  # Also start each ninfer with a shallow pending queue, e.g.
+  #     --max-concurrency 4 --max-pending-requests 1
+  # The proxy is the queue now. ninfer's default --max-pending-requests of 16
+  # lets a busy host silently absorb 16 more requests and block them behind the
+  # active set while other hosts idle -- the exact failure this router prevents.
+  - name: ninfer-a
+    url: http://10.0.0.11:8000
+    kind: ninfer
+    capacity: 4
+    models: [qwen3.6-27b]
+    # Context is discovered automatically (ninfer publishes --max-context on
+    # /v1/models). Set context_length only to override a wrong or missing value.
+    # context_length: 65536
+
+  - name: ninfer-b
+    url: http://10.0.0.12:8000
+    kind: ninfer
+    capacity: 2
+    models: [qwen3.6-27b]
+
+  # --- llama.cpp host -------------------------------------------------------
+  # capacity MUST equal llama-server's -np / --parallel.
+  # Leave /slots enabled (the default) and the router will cross-check its own
+  # in-flight count against the server's real slot state.
+  - name: llama-1
+    url: http://10.0.0.20:8080
+    kind: llamacpp
+    capacity: 4
+    models: [gpt-oss-120b]
+    # llama-server reports its own model id; set this if it differs from the name
+    # your clients send.
+    # upstream_model: "gpt-oss-120b"
+    #
+    # Context is read from /props (default_generation_settings.n_ctx), which is the
+    # *per-slot* figure: `-c 65536 -np 4` gives each request 16384. If you start
+    # llama-server with --no-props, set context_length here -- the fallback reads
+    # n_ctx_train from /v1/models, which is the model's architectural limit and will
+    # overstate what the server actually accepts.
+    # context_length: 16384
+
+  # --- vLLM -----------------------------------------------------------------
+  # Set capacity to --max-num-seqs (default 256). Do NOT gate vLLM to a small
+  # number: it schedules a continuous batch and queues internally without the
+  # head-of-line blocking that makes gating necessary elsewhere, so starving it
+  # of concurrency just wastes throughput.
+  #
+  # Start it with --enable-server-load-tracking and the router will cross-check
+  # its own in-flight count against vLLM's /load endpoint.
+  # Context comes from /v1/models max_model_len automatically.
+  - name: vllm-1
+    url: http://10.0.0.30:8000
+    kind: vllm
+    capacity: 256
+    models: [qwen3.6-27b]
+
+  # --- LM Studio ------------------------------------------------------------
+  # capacity must match the parallel-request setting in LM Studio's server UI.
+  # LM Studio has no /health, so the router uses /api/v0/models for liveness.
+  # Context comes from loaded_context_length -- what was actually allocated when
+  # the model was loaded, not the model's ceiling. If you load a 128k model with
+  # an 8k context, 8k is what the router advertises.
+  # Newer builds require a token: set api_key (${LM_API_TOKEN} works).
+  - name: lmstudio-1
+    url: http://10.0.0.40:1234
+    kind: lmstudio
+    capacity: 2
+    models: [qwen3.6-27b]
+    # api_key: "${LM_API_TOKEN}"

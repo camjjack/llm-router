@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Virtualenvs live in RUNNER_TEMP, never in the workspace: a venv inside the
+# checkout gets swept into the sdist, and its absolute `bin/python` symlink makes
+# the build fail with AbsoluteLinkError.
+env:
+  BUILD_VENV: ${{ runner.temp }}/build-venv
+  TEST_VENV: ${{ runner.temp }}/test-venv
+
+jobs:
+  wheel:
+    name: wheel (Ubuntu 24.04 system Python)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Identify the interpreter
+        # Deliberately no actions/setup-python: the point is to build with the
+        # Python that Ubuntu 24.04 ships (3.12.x). Asserting it means a change to
+        # the runner image fails here, loudly, instead of silently shifting what
+        # the wheel was built and tested against.
+        run: |
+          which python3
+          python3 -VV
+          python3 - <<'PY'
+          import sys
+          assert sys.version_info[:2] == (3, 12), f"expected Python 3.12, got {sys.version}"
+          print("OK: system Python " + ".".join(map(str, sys.version_info[:3])))
+          PY
+
+      - name: Create build environment
+        # 24.04 marks the system interpreter externally-managed (PEP 668), so
+        # `pip install` against it is refused. A venv is the supported route.
+        run: |
+          python3 -m venv "$BUILD_VENV"
+          "$BUILD_VENV/bin/python" -m pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        # `build` produces the sdist first, then builds the wheel *from* it. That
+        # is the stronger check: a file missing from the sdist fails here rather
+        # than surfacing for whoever installs from PyPI.
+        run: |
+          "$BUILD_VENV/bin/python" -m build --outdir dist
+
+      - name: Inspect artifacts
+        run: |
+          ls -l dist/
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ ${#wheels[@]} -ne 1 ]; then
+            echo "::error::expected exactly one wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          # llm_router is pure Python, so this is a py3-none-any wheel: one build
+          # serves every supported Python and platform, not just 3.12 on Linux.
+          case "${wheels[0]}" in
+            *-py3-none-any.whl) echo "OK: ${wheels[0]} is a universal wheel" ;;
+            *) echo "::error::unexpected wheel tag: ${wheels[0]}"; exit 1 ;;
+          esac
+
+      - name: Install the built wheel into a clean environment
+        # Installing the artifact rather than the checkout means the tests exercise
+        # what actually ships -- a module left out of the wheel fails here, where
+        # testing against src/ would never notice.
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          python3 -m venv "$TEST_VENV"
+          "$TEST_VENV/bin/python" -m pip install --upgrade pip
+          "$TEST_VENV/bin/python" -m pip install "${wheels[0]}" pytest pytest-asyncio
+
+      - name: Verify the import resolves to the installed package
+        run: |
+          "$TEST_VENV/bin/python" - <<'PY'
+          import llm_router
+          path = llm_router.__file__
+          assert "site-packages" in path, f"imported from the source tree, not the wheel: {path}"
+          print(f"OK: llm_router {llm_router.__version__} from {path}")
+          PY
+
+      - name: Smoke-test the console script
+        run: |
+          "$TEST_VENV/bin/llm-router" check -c config.example.yaml
+
+      - name: Run the test suite against the installed wheel
+        run: |
+          "$TEST_VENV/bin/python" -m pytest -q
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: llm-router-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
