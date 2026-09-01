@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 import httpx
 from conftest import running_app
@@ -173,22 +174,25 @@ async def test_pinned_session_spills_when_its_host_is_saturated():
         first = await client.post("/v1/chat/completions", json=turn(1))
         pinned = first.headers["x-llm-router-backend"]
 
-        # Occupy the pinned host with a long unrelated request.
-        blocker_upstream = next(u for u in (fast, other) if u.name == pinned)
-        blocker_upstream.latency_s = 1.5
-        blocker = asyncio.create_task(
-            client.post("/v1/chat/completions", json=turn(1, seed="blocker"))
-        )
-        await asyncio.sleep(0.3)
+        # Saturate the pinned host by holding its only slot directly. Sending an
+        # unrelated request would not do: idle backends rotate, so it would land
+        # on the other host.
+        blocker = await router.scheduler.acquire(MODEL, preferred=pinned)
+        assert blocker.name == pinned
+        assert router.scheduler.backends[pinned].free == 0
 
-        # The pinned session should hold out briefly, then spill.
+        # The pinned session should hold out for affinity_wait_ms, then spill.
+        started = time.monotonic()
         followup = await asyncio.wait_for(
             client.post("/v1/chat/completions", json=turn(2)), timeout=5.0
         )
+        elapsed = time.monotonic() - started
+
         assert followup.status_code == 200
         assert followup.headers["x-llm-router-backend"] != pinned
+        assert elapsed >= 0.2, "spilled before the affinity window closed"
         assert router.stats.affinity_spills >= 1
-        await blocker
+        blocker.release()
 
 
 # ------------------------------------------------------------------ streaming
@@ -383,3 +387,85 @@ async def test_session_id_is_not_forwarded_upstream():
         )
     assert response.status_code == 200
     assert upstream.request_log[-1]["body_keys"] == ["messages", "model"]
+
+
+# ------------------------------------------------------------- Open WebUI
+
+
+async def test_openwebui_chats_are_not_all_linked_together():
+    """Without any header, distinct chats must still route independently.
+
+    They share a system prompt, so a router that pinned on the shared prefix
+    would funnel every chat in the instance onto one backend.
+    """
+    ups = [FakeUpstream(name=n, max_concurrency=2, model=MODEL, latency_s=0.01)
+           for n in ("a", "b", "c")]
+    system = {"role": "system", "content": "You are a helpful assistant."}
+
+    async with router_stack(ups) as (client, router):
+        placements = {}
+        for chat in range(6):
+            body = {"model": MODEL, "messages": [
+                system, {"role": "user", "content": f"chat {chat} opening question"}]}
+            r = await client.post("/v1/chat/completions", json=body)
+            placements[chat] = r.headers["x-llm-router-backend"]
+
+    # Not all on one host: the shared system prompt alone never pins.
+    assert len(set(placements.values())) > 1, f"all chats funnelled together: {placements}"
+
+
+async def test_openwebui_chat_id_pins_each_chat_exactly():
+    ups = [FakeUpstream(name=n, max_concurrency=4, model=MODEL, latency_s=0.01)
+           for n in ("a", "b", "c")]
+    async with router_stack(ups) as (client, router):
+        seen = {}
+        for chat in ("chat-1", "chat-2"):
+            for turn_no in range(4):
+                body = {"model": MODEL, "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": f"unrelated text {turn_no}"}]}
+                r = await client.post("/v1/chat/completions", json=body,
+                                      headers={"x-openwebui-chat-id": chat})
+                seen.setdefault(chat, []).append(r.headers["x-llm-router-backend"])
+        stats = router.snapshot()["router"]
+
+    for chat, backends in seen.items():
+        assert len(set(backends)) == 1, f"{chat} hopped: {backends}"
+    assert stats["keys_from_header"] == 8
+    assert stats["keys_from_prefix"] == 0
+
+
+async def test_openwebui_user_id_does_not_pin():
+    """All of one user's chats must not collapse onto a single backend."""
+    ups = [FakeUpstream(name=n, max_concurrency=2, model=MODEL, latency_s=0.01)
+           for n in ("a", "b", "c")]
+    async with router_stack(ups) as (client, router):
+        placements = []
+        for chat in range(6):
+            body = {"model": MODEL, "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"chat {chat} opening"}]}
+            r = await client.post("/v1/chat/completions", json=body, headers={
+                "x-openwebui-user-id": "same-user",
+                "x-openwebui-user-email": "someone@example.com"})
+            placements.append(r.headers["x-llm-router-backend"])
+        stats = router.snapshot()["router"]
+
+    assert len(set(placements)) > 1, f"one user's chats funnelled together: {placements}"
+    # Identity came from the prompt, not from the user header.
+    assert stats["keys_from_header"] == 0
+    assert stats["keys_from_prefix"] == 6
+
+
+async def test_edited_message_keeps_its_chat_pin():
+    """Open WebUI regeneration rewrites history; the chat id does not change."""
+    ups = [FakeUpstream(name=n, max_concurrency=4, model=MODEL, latency_s=0.01)
+           for n in ("a", "b", "c")]
+    headers = {"x-openwebui-chat-id": "chat-edit"}
+    async with router_stack(ups) as (client, router):
+        first = await client.post("/v1/chat/completions", json=turn(4), headers=headers)
+        # User edits the opening message: the whole prefix changes.
+        rewritten = {"model": MODEL, "messages": [
+            SYSTEM, {"role": "user", "content": "completely different opening"}]}
+        second = await client.post("/v1/chat/completions", json=rewritten, headers=headers)
+    assert second.headers["x-llm-router-backend"] == first.headers["x-llm-router-backend"]

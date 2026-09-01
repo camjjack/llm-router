@@ -113,6 +113,10 @@ class RouterStats:
     started_at: float = field(default_factory=time.monotonic)
     backends: dict[str, BackendStats] = field(default_factory=dict)
 
+    # Conversation identity taken from a client-supplied header (exact).
+    keys_from_header: int = 0
+    # Conversation identity inferred by hashing the prompt prefix (fallback).
+    keys_from_prefix: int = 0
     # A request arrived with a known session pin.
     affinity_hits: int = 0
     # No pin was known (new conversation, or the pin had expired).
@@ -149,6 +153,8 @@ class RouterStats:
     def snapshot(self) -> dict:
         return {
             "uptime_s": time.monotonic() - self.started_at,
+            "keys_from_header": self.keys_from_header,
+            "keys_from_prefix": self.keys_from_prefix,
             "affinity_hits": self.affinity_hits,
             "affinity_misses": self.affinity_misses,
             "affinity_honored": self.affinity_honored,

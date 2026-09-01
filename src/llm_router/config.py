@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .affinity import DEFAULT_SESSION_HEADERS
+
 # Backend engines we know how to probe. They differ in where they publish context
 # length and load, and in whether they want to be saturated -- see BackendConfig.
 KINDS = ("ninfer", "llamacpp", "vllm", "lmstudio", "openai")
@@ -95,6 +97,10 @@ class RoutingConfig:
     max_retries: int = 2
     # Number of message-boundary hashes recorded per request (longest-prefix depth).
     affinity_depth: int = 3
+    # Request headers carrying an exact conversation id, tried in order before
+    # falling back to hashing the prompt. Override when a client renames its
+    # header (Open WebUI's FORWARD_SESSION_INFO_HEADER_CHAT_ID, for instance).
+    session_headers: tuple[str, ...] = DEFAULT_SESSION_HEADERS
     # Add stream_options.include_usage when the client omitted it. Off by default:
     # it appends a chunk the client did not ask for. Most agentic clients (anything
     # on the Vercel AI SDK, which opencode uses) already request usage themselves.
@@ -176,6 +182,15 @@ def _section(raw: dict[str, Any], key: str, cls: type) -> Any:
             f"unknown key(s) in '{key}': {', '.join(sorted(unknown))}. "
             f"Valid keys: {', '.join(sorted(known))}"
         )
+    data = dict(data)
+    if "session_headers" in data:
+        value = data["session_headers"]
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            raise ConfigError("routing.session_headers must be a list of header names")
+        # Header lookups are lowercase; normalise so config casing does not matter.
+        data["session_headers"] = tuple(str(v).lower() for v in value)
     return cls(**data)
 
 

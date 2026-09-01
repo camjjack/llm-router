@@ -135,6 +135,8 @@ def render(snapshot: dict[str, Any]) -> Group:
             _pct(router.get("affinity_honor_rate")),
         ),
     )
+    from_header = router.get("keys_from_header", 0)
+    from_prefix = router.get("keys_from_prefix", 0)
     summary.add_row(
         "sessions",
         Text(
@@ -142,6 +144,14 @@ def render(snapshot: dict[str, Any]) -> Group:
             f"(new {router.get('affinity_misses', 0)} / returning "
             f"{router.get('affinity_hits', 0)})",
             style="dim",
+        ),
+    )
+    summary.add_row(
+        "identity",
+        Text.assemble(
+            (f"{from_header} from header", "green" if from_header else "dim"),
+            ("  ", "dim"),
+            (f"{from_prefix} inferred from prompt", "dim"),
         ),
     )
     summary.add_row(

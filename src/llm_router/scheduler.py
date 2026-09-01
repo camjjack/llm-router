@@ -36,6 +36,9 @@ class BackendState:
     healthy: bool = True
     consecutive_failures: int = 0
     cooldown_until: float = 0.0
+    # Monotonic stamp of the last placement, used to break ties between equally
+    # loaded backends. See _choose.
+    last_assigned: int = 0
 
     @property
     def name(self) -> str:
@@ -110,6 +113,7 @@ class Scheduler:
         self._health = health or HealthConfig()
         self._waiters: list[_Waiter] = []
         self._seq = itertools.count()
+        self._placements = itertools.count(1)
         self._pump_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- lifecycle
@@ -234,6 +238,7 @@ class Scheduler:
 
             backend, honored, spilled = choice
             backend.inflight += 1
+            backend.last_assigned = next(self._placements)
             self._drop(waiter)
             waiter.future.set_result(
                 Lease(
@@ -274,10 +279,18 @@ class Scheduler:
 
         # Spill (or first placement): least loaded by fraction of capacity used, so a
         # 4-slot host takes proportionally more work than a 2-slot one.
+        #
+        # Ties are broken by least-recently-assigned rather than by name. It
+        # matters more than it looks: chat traffic is often sequential, so every
+        # backend is idle when each new conversation starts. A fixed tie-break
+        # would send every one of them to the same host, which then pins them all
+        # and holds every conversation's KV while the others stay cold. Rotating
+        # spreads new conversations, and keeps each host's retained-checkpoint set
+        # small enough to survive (ninfer keeps only 2x max-concurrency of them).
         free = [b for b in candidates if b.free > 0]
         if not free:
             return None
-        best = min(free, key=lambda b: (b.load, b.inflight, b.name))
+        best = min(free, key=lambda b: (b.load, b.inflight, b.last_assigned, b.name))
         return (best, False, pinned is not None)
 
     # ----------------------------------------------------------------- release

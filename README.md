@@ -213,6 +213,38 @@ Cache-hit accounting is normalised across the two: Anthropic's `input_tokens` *e
 tokens while OpenAI's `prompt_tokens` includes them, so the surfaces reconcile that before it
 reaches the dashboard and the `cache` column means the same thing either way.
 
+## Open WebUI
+
+Chats are routed **independently** — they are not lumped together. Pinning ignores the first message
+boundary, which is the system prompt every chat in the instance shares, so identity starts at the
+first user message. Two chats collide only if they open with byte-identical text, and in that case
+they genuinely share a KV prefix, so co-locating them is the right answer; they separate as soon as
+they diverge.
+
+For exact per-chat routing, turn on Open WebUI's header forwarding:
+
+```bash
+ENABLE_FORWARD_USER_INFO_HEADERS=true
+```
+
+Open WebUI then sends `X-OpenWebUI-Chat-Id`, which the router pins on directly. That is better than
+inference in one specific way: it survives a user **editing or regenerating** an earlier message,
+where the prompt prefix legitimately changes but the conversation has not, so the chat stays on the
+host that still holds most of its KV.
+
+Check it is working in the dashboard's `identity` row, or:
+
+```bash
+curl -s localhost:8080/stats | jq '.router | {keys_from_header, keys_from_prefix}'
+```
+
+### Why chat id and not user id
+
+Open WebUI also forwards `X-OpenWebUI-User-Id`, and the router **deliberately ignores it**. Pinning
+per user would pile all of one person's chats onto a single host: worse for balance, and no better
+for cache reuse than pinning each chat separately. Identity is not the unit of KV locality — a
+conversation is. There is a test asserting the user headers never form a pin.
+
 ## Configure your backends to match
 
 Two settings matter as much as the router config:
@@ -267,7 +299,11 @@ For each request: derive the session key → look up the pinned backend → then
 2. Pinned host is busy → wait up to `affinity_wait_ms` for it. A short wait usually beats
    re-prefilling the whole conversation on a cold host.
 3. Window expired (or no pin) → **least-loaded** healthy backend by fraction of capacity used, so a
-   4-slot host takes proportionally more than a 2-slot one. Re-pin the session there.
+   4-slot host takes proportionally more than a 2-slot one. Ties among equally idle backends rotate
+   (least-recently-assigned wins) rather than resolving to a fixed order — chat traffic is often
+   sequential, so *every* backend is idle when each new conversation starts, and a fixed tie-break
+   would send them all to the same host and pin them there while the rest stayed cold. Re-pin the
+   session there.
 4. Nothing free anywhere → stay queued until `queue_timeout_s`, then 503.
 
 Queueing and outage are treated differently. A *busy* pool is normal backpressure, so requests wait

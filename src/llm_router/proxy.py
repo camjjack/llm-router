@@ -124,7 +124,9 @@ class Router:
         streaming = bool(body.get("stream"))
         routing = self.config.routing
 
-        explicit = explicit_session_id(body, request.headers)
+        explicit = explicit_session_id(
+            body, request.headers, routing.session_headers
+        )
         keys = [explicit] if explicit else surface.session_keys(body)
         min_depth = 1 if explicit else surface.min_affinity_depth
         if surface is OPENAI:
@@ -135,6 +137,12 @@ class Router:
 
         preferred = self.sessions.lookup(keys, min_depth) if keys else None
         if keys:
+            # Track where identity came from, so it is possible to confirm that a
+            # client's own conversation id is being used rather than guessed at.
+            if explicit:
+                self.stats.keys_from_header += 1
+            else:
+                self.stats.keys_from_prefix += 1
             if preferred:
                 self.stats.affinity_hits += 1
             else:

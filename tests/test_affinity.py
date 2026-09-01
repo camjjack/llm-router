@@ -115,9 +115,56 @@ def test_explicit_session_id_from_header():
         def get(self, key, default=None):
             return dict.get(self, key, default)
 
-    assert explicit_session_id({}, Headers({"x-session-id": "abc"})) == "explicit:abc"
+    # The header name is part of the key, so two clients using different headers
+    # cannot collide on the same value.
+    assert explicit_session_id({}, Headers({"x-session-id": "abc"})) == "explicit:x-session-id:abc"
     assert explicit_session_id({"session_id": "xyz"}, Headers()) == "explicit:xyz"
     assert explicit_session_id({}, Headers()) is None
+
+
+def test_openwebui_chat_id_is_recognised():
+    class Headers(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    key = explicit_session_id({}, Headers({"x-openwebui-chat-id": "chat-42"}))
+    assert key == "explicit:x-openwebui-chat-id:chat-42"
+
+
+def test_openwebui_user_id_is_deliberately_ignored():
+    """Pinning per user would pile all of one person's chats onto one host."""
+    class Headers(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    headers = Headers({
+        "x-openwebui-user-id": "user-1",
+        "x-openwebui-user-email": "someone@example.com",
+        "x-openwebui-user-name": "Someone",
+    })
+    assert explicit_session_id({}, headers) is None, (
+        "identity is not the unit of KV locality; a conversation is"
+    )
+
+
+def test_chat_id_wins_over_prompt_hashing():
+    class Headers(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    both = Headers({"x-openwebui-chat-id": "chat-9", "x-openwebui-user-id": "user-1"})
+    assert explicit_session_id({}, both) == "explicit:x-openwebui-chat-id:chat-9"
+
+
+def test_custom_session_header_names():
+    """Open WebUI lets the header name be renamed via env var."""
+    class Headers(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    headers = Headers({"x-my-renamed-chat": "c1"})
+    assert explicit_session_id({}, headers) is None
+    assert explicit_session_id({}, headers, ("x-my-renamed-chat",)) == "explicit:x-my-renamed-chat:c1"
 
 
 def test_empty_and_malformed_bodies_are_safe():

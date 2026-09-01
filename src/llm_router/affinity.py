@@ -91,7 +91,26 @@ def session_keys(
     return keys
 
 
-def explicit_session_id(body: dict[str, Any], headers: Any) -> str | None:
+# Headers that carry an exact conversation id, tried in order. Open WebUI sends
+# X-OpenWebUI-Chat-Id when ENABLE_FORWARD_USER_INFO_HEADERS=true (it allows the
+# name to be overridden, hence the configurability).
+#
+# Deliberately absent: X-OpenWebUI-User-Id. Pinning per *user* would pile all of
+# one person's chats onto a single host -- worse for balance, and no better for
+# cache reuse than pinning each chat separately. Identity is not the unit of KV
+# locality; a conversation is.
+DEFAULT_SESSION_HEADERS = (
+    "x-session-id",
+    "x-conversation-id",
+    "x-openwebui-chat-id",
+)
+
+
+def explicit_session_id(
+    body: dict[str, Any],
+    headers: Any,
+    session_headers: Sequence[str] = DEFAULT_SESSION_HEADERS,
+) -> str | None:
     """An exact conversation id, when the client supplies one.
 
     Claude Code sends `x-claude-code-session-id` on every request, which beats
@@ -109,9 +128,10 @@ def explicit_session_id(body: dict[str, Any], headers: Any) -> str | None:
             suffix = f"/{agent}" if agent else ""
             return f"explicit:cc:{claude_session}{suffix}"
 
-        header = headers.get("x-session-id") or headers.get("x-conversation-id")
-        if header:
-            return f"explicit:{header}"
+        for name in session_headers:
+            value = headers.get(name)
+            if value:
+                return f"explicit:{name}:{value}"
 
     value = body.get("session_id")
     if value and isinstance(value, str):
