@@ -260,8 +260,19 @@ def load_config(path: str | Path) -> Config:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
+    return parse_config(path.read_text())
 
-    raw = yaml.safe_load(path.read_text()) or {}
+
+def parse_config(text: str) -> Config:
+    """Parse and validate config text.
+
+    Separate from load_config so a reload can hash and parse the very same bytes,
+    rather than reading the file twice and racing a writer in between.
+    """
+    try:
+        raw = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"invalid YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
     raw = _expand(raw)

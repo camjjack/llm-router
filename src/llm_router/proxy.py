@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -18,11 +19,26 @@ from . import surfaces
 from .affinity import SessionMap, explicit_session_id
 from .backend import BackendClients
 from .config import Config
-from .scheduler import Lease, NoBackendError, QueueTimeout, Scheduler
+from .scheduler import (
+    BackendDiff,
+    BackendState,
+    Lease,
+    NoBackendError,
+    QueueTimeout,
+    Scheduler,
+)
 from .stats import RouterStats
 from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface
 
 log = logging.getLogger("llm_router.proxy")
+
+# How many distinct requested model names to remember for the stranded-model
+# warning on reload. Names are client-supplied, so this has to be bounded.
+MAX_REMEMBERED_MODEL_NAMES = 256
+
+# Re-dos caused by a reload landing mid-request, as opposed to a backend failing.
+# It would take a fresh reload inside each attempt to use these up.
+MAX_RELOAD_REROUTES = 3
 
 # Upstream statuses worth trying on a different backend.
 RETRYABLE_STATUSES = {429, 502, 503, 504, 529}
@@ -63,8 +79,20 @@ class Router:
         )
         for backend in config.backends:
             self.stats.backend(backend.name)
+        self.scheduler.on_drained = self._on_drained
         # Models we have already complained about having mismatched contexts.
         self._context_warned: set[str] = set()
+        # Requested model name -> when a request for it was last routed. Lets a
+        # reload notice it is about to strand a name clients are still using.
+        self._requested_seen: OrderedDict[str, float] = OrderedDict()
+
+        # Reload bookkeeping, surfaced in /stats and the dashboard.
+        self.config_generation = 1
+        self.config_loaded_at = time.time()
+        self.config_error: str | None = None
+        # How the config file is being watched ("inotify", "polling"), if at all.
+        self.config_watch: str | None = None
+        self._applying = False
 
     async def start(self) -> None:
         await self.scheduler.start()
@@ -73,6 +101,130 @@ class Router:
     async def stop(self) -> None:
         await self.scheduler.stop()
         await self.clients.aclose()
+
+    # ------------------------------------------------------------------ reload
+
+    def apply_config(self, new: Config) -> BackendDiff:
+        """Switch to a new config without disturbing anything already running.
+
+        Deliberately contains no `await`: the scheduler, the clients, the session
+        map and `self.config` all move to the new config in one step, so no request
+        can see some of it and not the rest. Requests already running finish where
+        they are, even on a backend that has just been removed.
+        """
+        old = self.config
+        self._applying = True
+        try:
+            diff = self.scheduler.reconfigure(new.backends, new.health)
+        finally:
+            self._applying = False
+        self.clients.reconfigure(new, diff)
+
+        routing = new.routing
+        self.sessions.reconfigure(
+            routing.session_ttl_s, routing.max_sessions, routing.affinity_depth
+        )
+        dropped = self.sessions.forget_backends({*diff.removed, *diff.replaced})
+
+        # A replaced backend is a different machine under the same name; its
+        # predecessor's latency and cache figures say nothing about it. Likewise a
+        # name that is back after being removed starts from zero.
+        for name in (*diff.replaced, *diff.added):
+            self.stats.backends.pop(name, None)
+        for backend in new.backends:
+            self.stats.backend(backend.name)
+
+        self.config = new
+        self._context_warned.clear()
+        self.config_generation += 1
+        self.config_loaded_at = time.time()
+        self.config_error = None
+
+        log.info(
+            "config reloaded (generation %d): %s",
+            self.config_generation,
+            self._describe_reload(old, new, diff, dropped),
+        )
+        self._warn_stranded_models()
+        return diff
+
+    def config_failed(self, message: str) -> None:
+        """A reload was rejected; the running config stays in force."""
+        self.config_error = message
+
+    def _describe_reload(
+        self, old: Config, new: Config, diff: BackendDiff, dropped_pins: int
+    ) -> str:
+        parts: list[str] = []
+        if diff.added:
+            parts.append(f"added {', '.join(diff.added)}")
+        draining = {s.name: s.inflight for s in self.scheduler.draining}
+        for label, names in (("removed", diff.removed), ("re-pointed", diff.replaced)):
+            if names:
+                parts.append(
+                    f"{label} "
+                    + ", ".join(
+                        f"{n} (draining {draining[n]} in flight)" if n in draining else n
+                        for n in names
+                    )
+                )
+        for name, changed in diff.updated.items():
+            if "capacity" in changed:
+                before = next((b.capacity for b in old.backends if b.name == name), "?")
+                after = next(b.capacity for b in new.backends if b.name == name)
+                changed = [
+                    f"capacity {before}->{after}" if c == "capacity" else c
+                    for c in changed
+                ]
+            parts.append(f"updated {name} ({', '.join(changed)})")
+        for section in ("model_aliases", "routing", "health", "timeouts"):
+            if getattr(old, section) != getattr(new, section):
+                parts.append(f"{section} changed")
+        if dropped_pins:
+            parts.append(f"dropped {dropped_pins} session pins")
+        return "; ".join(parts) or "no changes"
+
+    def _warn_stranded_models(self) -> None:
+        """Say so when a model name clients were recently using stops resolving.
+
+        The usual way a model swap breaks a running client: Claude Code or opencode
+        keeps sending the name it was started with, and after the edit that name
+        404s. An alias from the old name to the new model keeps it working.
+        """
+        horizon = time.monotonic() - self.config.routing.session_ttl_s
+        for requested, seen in self._requested_seen.items():
+            if seen < horizon:
+                continue
+            if self.config.backends_for(self.resolve_model(requested)):
+                continue
+            log.warning(
+                "clients requested model '%s' within the last %ds and it no longer "
+                "resolves to any backend, so their next requests will 404. To keep "
+                "them working, add it to model_aliases, e.g.  model_aliases: "
+                "{\"%s\": <new model>}",
+                requested,
+                self.config.routing.session_ttl_s,
+                requested,
+            )
+
+    def _on_drained(self, state: BackendState) -> None:
+        if state.name not in self.scheduler.backends:
+            # Removed outright rather than re-pointed: nothing left to report on.
+            self.stats.backends.pop(state.name, None)
+        if not self._applying:
+            # An idle backend drains inside apply_config, whose summary covers it.
+            log.info(
+                "backend %s (%s) drained: its last request has finished",
+                state.name,
+                state.config.url,
+            )
+
+    def _note_requested(self, requested: str) -> None:
+        seen = self._requested_seen
+        seen[requested] = time.monotonic()
+        seen.move_to_end(requested)
+        while len(seen) > MAX_REMEMBERED_MODEL_NAMES:
+            seen.popitem(last=False)
 
     # ------------------------------------------------------------------ routing
 
@@ -112,17 +264,21 @@ class Router:
         if not isinstance(requested, str) or not requested:
             return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
 
+        # Read once: a reload may swap self.config while this request waits, and
+        # one request should not mix settings from two generations.
+        config = self.config
         model = self.resolve_model(requested)
-        if not self.config.backends_for(model):
+        if not config.backends_for(model):
             return surface.error(
                 404,
                 f"model '{requested}' is not served by any configured backend "
-                f"(known: {', '.join(self.config.all_models)})",
+                f"(known: {', '.join(config.all_models)})",
                 surfaces.MODEL_NOT_FOUND,
             )
+        self._note_requested(requested)
 
         streaming = bool(body.get("stream"))
-        routing = self.config.routing
+        routing = config.routing
 
         explicit = explicit_session_id(
             body, request.headers, routing.session_headers
@@ -158,8 +314,10 @@ class Router:
 
         excluded: set[str] = set()
         last_error: Response | None = None
+        failures = 0
+        reroutes = MAX_RELOAD_REROUTES
 
-        for attempt in range(routing.max_retries + 1):
+        while failures <= routing.max_retries:
             try:
                 lease = await self.scheduler.acquire(
                     model,
@@ -170,6 +328,14 @@ class Router:
                     unavailable_grace_s=routing.unavailable_grace_s,
                 )
             except NoBackendError:
+                if reroutes and self.config is not config:
+                    # A reload landed while this request waited, and may have
+                    # renamed its model. Follow the new aliases before giving up.
+                    reroutes -= 1
+                    config = self.config
+                    model = self.resolve_model(requested)
+                    if config.backends_for(model):
+                        continue
                 if last_error is not None:
                     return last_error
                 self.stats.rejected_no_backend += 1
@@ -186,8 +352,19 @@ class Router:
                     surfaces.QUEUE_TIMEOUT,
                 )
 
+            if self.scheduler.backends.get(lease.name) is not lease.backend:
+                # Granted just before a reload removed this backend or pointed its
+                # name at another host. Nothing has been sent, so ask again.
+                lease.release()
+                if reroutes:
+                    reroutes -= 1
+                    continue
+                return surface.error(
+                    503, "backend was reconfigured; retry", surfaces.NO_BACKEND
+                )
+
             self._record_lease(lease, pinned=preferred is not None)
-            if attempt:
+            if failures:
                 self.stats.retries += 1
 
             outcome, response = await self._dispatch(
@@ -199,6 +376,7 @@ class Router:
             last_error = response
             excluded.add(lease.name)
             preferred = None
+            failures += 1
 
         return last_error or surface.error(502, "all backends failed", surfaces.ALL_FAILED)
 
@@ -223,11 +401,8 @@ class Router:
             return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
         model = self.resolve_model(requested)
 
-        candidates = [
-            b
-            for b in self.config.backends_for(model)
-            if self.scheduler.backends[b.name].healthy
-        ]
+        states = [self.scheduler.backends.get(b.name) for b in self.config.backends_for(model)]
+        candidates = [s for s in states if s is not None and s.healthy]
         if not candidates:
             return surface.error(
                 503,
@@ -237,9 +412,10 @@ class Router:
 
         keys = surface.session_keys(body)
         pinned = self.sessions.lookup(keys, surface.min_affinity_depth) if keys else None
-        backend = next((b for b in candidates if b.name == pinned), None) or min(
-            candidates, key=lambda b: self.scheduler.backends[b.name].inflight
+        chosen = next((s for s in candidates if s.name == pinned), None) or min(
+            candidates, key=lambda s: s.inflight
         )
+        backend = chosen.config
 
         payload = dict(body)
         if backend.upstream_model:
@@ -249,12 +425,15 @@ class Router:
 
         headers = self._upstream_headers(backend, request, streaming=False)
         try:
-            upstream = await self.clients.client(backend.name).post(
-                "/v1/messages/count_tokens",
-                json=payload,
-                headers=headers,
-                params=dict(request.query_params),
-            )
+            # Borrowed, so a reload cannot close the client under this call.
+            with self.clients.lend(backend.name) as client:
+                upstream = await client.post(
+                    "/v1/messages/count_tokens",
+                    json=payload,
+                    headers=headers,
+                    params=dict(request.query_params),
+                    timeout=self.clients.request_timeout(),
+                )
         except (httpx.HTTPError, OSError) as exc:
             return surface.error(
                 502,
@@ -316,7 +495,11 @@ class Router:
         model: str,
     ) -> tuple[str, Response]:
         backend = lease.backend.config
-        client = self.clients.client(backend.name)
+        # Borrowed for exactly as long as the slot is held, so a reload that
+        # retires this client closes it only once the request is done with it.
+        upstream = self.clients.checkout(backend.name)
+        lease.on_release(lambda: self.clients.checkin(upstream))
+        client = upstream.client
 
         # The only body change is the model name, which a gateway is expected to
         # rewrite -- an aliased name must not reach the backend. Everything else
@@ -342,7 +525,7 @@ class Router:
             )
         except (httpx.HTTPError, OSError) as exc:
             lease.release()
-            self.scheduler.note_failure(backend.name)
+            self.scheduler.note_failure(lease.backend)
             self.stats.backend(backend.name).errors += 1
             log.warning("backend %s transport error: %r", backend.name, exc)
             return (
@@ -368,16 +551,22 @@ class Router:
     ) -> tuple[str, Response]:
         name = lease.name
         upstream = await client.post(
-            surface.path, json=payload, headers=headers, params=params
+            surface.path,
+            json=payload,
+            headers=headers,
+            params=params,
+            timeout=self.clients.request_timeout(),
         )
 
         # Non-streaming: the slot is free the moment the body is in hand.
         if upstream.status_code != 200:
             lease.release()
-            return self._upstream_error(name, upstream.status_code, upstream.content, surface)
+            return self._upstream_error(
+                lease.backend, upstream.status_code, upstream.content, surface
+            )
 
         lease.release()
-        self.scheduler.note_success(name)
+        self.scheduler.note_success(lease.backend)
 
         bstats = self.stats.backend(name)
         bstats.completed += 1
@@ -418,7 +607,12 @@ class Router:
     ) -> tuple[str, Response]:
         name = lease.name
         request = client.build_request(
-            "POST", surface.path, json=payload, headers=headers, params=params
+            "POST",
+            surface.path,
+            json=payload,
+            headers=headers,
+            params=params,
+            timeout=self.clients.request_timeout(),
         )
         # send(stream=True) returns once headers are in, so we can still fail over
         # to another backend before any bytes reach the client.
@@ -428,9 +622,9 @@ class Router:
             content = await upstream.aread()
             await upstream.aclose()
             lease.release()
-            return self._upstream_error(name, upstream.status_code, content, surface)
+            return self._upstream_error(lease.backend, upstream.status_code, content, surface)
 
-        self.scheduler.note_success(name)
+        self.scheduler.note_success(lease.backend)
         if keys:
             self.sessions.assign(keys, name, min_depth)
 
@@ -468,7 +662,7 @@ class Router:
             # Mid-stream failure: the client has bytes already, so we cannot retry.
             failed = True
             log.warning("backend %s stream aborted: %r", name, exc)
-            self.scheduler.note_failure(name)
+            self.scheduler.note_failure(lease.backend)
         finally:
             # Runs on normal completion, upstream error, and client disconnect
             # alike. A leaked slot here is precisely the bug this router exists to
@@ -489,8 +683,9 @@ class Router:
                         bstats.tokens_per_s.append(usage.completion_tokens / decode_s)
 
     def _upstream_error(
-        self, name: str, status: int, content: bytes, surface: Surface
+        self, state: BackendState, status: int, content: bytes, surface: Surface
     ) -> tuple[str, Response]:
+        name = state.name
         bstats = self.stats.backend(name)
         code = None
         try:
@@ -518,10 +713,10 @@ class Router:
             )
         bstats.errors += 1
         if retryable:
-            self.scheduler.note_failure(name)
+            self.scheduler.note_failure(state)
         else:
             # A 4xx is the client's fault; it says nothing about backend health.
-            self.scheduler.note_success(name)
+            self.scheduler.note_success(state)
 
         # The backend's error body is relayed byte-for-byte. Claude Code's
         # capability-retry logic matches on the upstream's own error wording, so
@@ -622,7 +817,21 @@ class Router:
             entry["pinned_sessions"] = pins.get(name, 0)
             entry["observed_busy"] = self.clients.observed_busy.get(name)
             entry["cooling_down"] = state.cooldown_until > time.monotonic()
+            entry["draining"] = False
             backends.append(entry)
+
+        # Taken out of the config by a reload, still finishing what they were doing.
+        for state in sched.draining:
+            backends.append({
+                "name": state.name,
+                "kind": state.config.kind,
+                "url": state.config.url,
+                "models": list(state.config.models),
+                "inflight": state.inflight,
+                "capacity": state.capacity,
+                "healthy": state.healthy,
+                "draining": True,
+            })
 
         return {
             "router": self.stats.snapshot()
@@ -630,6 +839,12 @@ class Router:
                 "queue_depth": sched.queue_depth,
                 "waiting_on_affinity": sched.waiting_on_affinity,
                 "tracked_sessions": len(self.sessions),
+            },
+            "config": {
+                "generation": self.config_generation,
+                "loaded_at": self.config_loaded_at,
+                "error": self.config_error,
+                "watch": self.config_watch,
             },
             "backends": backends,
             "models": {
@@ -639,15 +854,22 @@ class Router:
         }
 
 
-def create_app(config: Config, router: Router | None = None) -> Starlette:
+def create_app(
+    config: Config, router: Router | None = None, reloader: Any = None
+) -> Starlette:
+    """`reloader`, if given, is a ConfigReloader started and stopped with the app."""
     router = router or Router(config)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette):
         await router.start()
+        if reloader is not None:
+            await reloader.start()
         try:
             yield
         finally:
+            if reloader is not None:
+                await reloader.stop()
             await router.stop()
 
     app = Starlette(

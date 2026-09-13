@@ -81,6 +81,10 @@ class FakeUpstream:
     query_log: list[str] = field(default_factory=list)
     # Emit an SSE ping mid-stream; Claude Code needs these relayed unfiltered.
     emit_ping: bool = False
+    # Report cached-token counts in usage at all. vLLM omits them entirely unless
+    # started with --enable-prompt-tokens-details, and that silence must not be
+    # read as "nothing was cached".
+    report_cache: bool = True
 
     _port: int = 0
     _server: uvicorn.Server | None = None
@@ -213,6 +217,17 @@ class FakeUpstream:
         self.seen_prefixes.update(hashes)
         return matched * TOKENS_PER_MESSAGE
 
+    def _anthropic_usage(self, fresh: int, cached: int, output: int) -> dict:
+        if not self.report_cache:
+            # No cache fields at all, so input_tokens is the whole prompt.
+            return {"input_tokens": fresh + cached, "output_tokens": output}
+        return {
+            "input_tokens": fresh,
+            "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": output,
+        }
+
     async def _messages(self, request: Request):
         """Anthropic Messages API, as ninfer/llama.cpp/vLLM/LM Studio all expose it."""
         body = await request.json()
@@ -260,12 +275,7 @@ class FakeUpstream:
                 "model": self.model,
                 "content": [{"type": "text", "text": "ok"}],
                 "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": fresh,
-                    "cache_read_input_tokens": cached,
-                    "cache_creation_input_tokens": 0,
-                    "output_tokens": self.chunks,
-                },
+                "usage": self._anthropic_usage(fresh, cached, self.chunks),
             })
 
     async def _stream_anthropic(self, fresh: int, cached: int):
@@ -279,12 +289,7 @@ class FakeUpstream:
                 "message": {
                     "id": "msg_fake", "type": "message", "role": "assistant",
                     "model": self.model, "content": [],
-                    "usage": {
-                        "input_tokens": fresh,
-                        "cache_read_input_tokens": cached,
-                        "cache_creation_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
+                    "usage": self._anthropic_usage(fresh, cached, 0),
                 },
             })
             yield sse("content_block_start", {
@@ -360,8 +365,9 @@ class FakeUpstream:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": self.chunks,
             "total_tokens": prompt_tokens + self.chunks,
-            "prompt_tokens_details": {"cached_tokens": cached},
         }
+        if self.report_cache:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
 
         if body.get("stream"):
             return StreamingResponse(

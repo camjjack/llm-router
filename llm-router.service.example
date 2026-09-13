@@ -1,0 +1,79 @@
+# Example systemd unit for llm-router.
+#
+#   sudo cp llm-router.service.example /etc/systemd/system/llm-router.service
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now llm-router
+#
+#   journalctl -u llm-router -f          # follow the logs
+#   sudo systemctl reload llm-router     # re-read config.yaml, no restart
+#
+# Adjust ExecStart's paths to wherever the venv and config actually live.
+
+[Unit]
+Description=llm-router: capacity-aware, session-sticky LLM load balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=exec needs systemd 240+ (2019). On anything older, use Type=simple.
+Type=exec
+User=llm-router
+Group=llm-router
+
+# Secrets that config.yaml refers to as ${VAR}, such as LM_API_TOKEN=... The
+# leading - makes the file optional. Keep it mode 600 if it holds real secrets.
+EnvironmentFile=-/etc/llm-router/env
+
+# Without this, Python block-buffers stdout when it is not a terminal and the
+# access log reaches the journal in delayed bursts.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/llm-router/venv/bin/llm-router serve \
+    --config /etc/llm-router/config.yaml \
+    --log-level info
+
+# The router logs to stderr whenever no log_file is set, and systemd routes that
+# to the journal. So do NOT set log_file in config.yaml, and do not pass
+# --log-file or --tui here: either one sends the logs to a file and the journal
+# gets nothing. To watch a running service, use:
+#     llm-router top --url http://127.0.0.1:8080
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-router
+
+# systemctl reload -> SIGHUP -> re-read config.yaml in place. Requests already
+# running, long streams included, finish undisturbed, and a file that fails
+# validation is ignored with the running config left in force. The router also
+# picks up saved edits by itself, so this is mainly for --no-reload setups or a
+# config on a network filesystem, where file watching cannot see the change.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2s
+
+# Stopping waits for in-flight generations to finish; raise this if your longest
+# responses run longer than a minute.
+TimeoutStopSec=60s
+
+# One connection per slot on every backend, plus every client connection.
+LimitNOFILE=65536
+
+# --- hardening: this process needs outbound TCP and its config file, nothing else
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+# ProtectSystem=strict makes the whole filesystem read-only. Uncomment if you
+# chose a log_file over the journal, so that its directory stays writable.
+# ReadWritePaths=/var/log/llm-router
+
+[Install]
+WantedBy=multi-user.target

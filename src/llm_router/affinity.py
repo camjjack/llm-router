@@ -152,6 +152,25 @@ class SessionMap:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def reconfigure(self, ttl_s: float, max_entries: int, depth: int) -> None:
+        """Adopt new limits. Existing pins keep the expiry they were given."""
+        self._ttl = ttl_s
+        self._max = max_entries
+        self._depth = max(1, depth)
+        self._evict()
+
+    def forget_backends(self, names: set[str]) -> int:
+        """Drop every pin to these backends, returning how many went.
+
+        For a backend that is gone, or now points at a different host: its KV is
+        not somewhere the session can reach any more, so the pin would only make
+        the next turn wait for a host with nothing cached.
+        """
+        stale = [key for key, (backend, _) in self._entries.items() if backend in names]
+        for key in stale:
+            del self._entries[key]
+        return len(stale)
+
     def lookup(self, keys: list[str], min_depth: int = MIN_AFFINITY_DEPTH) -> str | None:
         """Longest-prefix match: the deepest known boundary wins."""
         now = time.monotonic()

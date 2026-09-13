@@ -1,6 +1,10 @@
 # llm-router configuration.
 #
 # Copy to config.yaml and edit. Validate with:  uv run llm-router check -c config.yaml
+#
+# A running router picks up saved edits by itself (or on SIGHUP): running requests
+# finish undisturbed, and a file that fails validation is ignored. Only `listen` and
+# `log_file` need a restart. See "Changing the config while it runs" in the README.
 
 listen:
   host: 0.0.0.0
@@ -98,7 +102,9 @@ backends:
   # of concurrency just wastes throughput.
   #
   # Start it with --enable-server-load-tracking and the router will cross-check
-  # its own in-flight count against vLLM's /load endpoint.
+  # its own in-flight count against vLLM's /load endpoint. Add
+  # --enable-prompt-tokens-details as well, or vLLM reports no cached-token counts
+  # and the dashboard's cache column stays empty however well its cache is doing.
   # Context comes from /v1/models max_model_len automatically.
   - name: vllm-1
     url: http://10.0.0.30:8000

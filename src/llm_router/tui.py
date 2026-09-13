@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable
 
 import httpx
@@ -80,7 +81,10 @@ def render(snapshot: dict[str, Any]) -> Group:
     for entry in backends:
         healthy = entry.get("healthy")
         cooling = entry.get("cooling_down")
-        if not healthy:
+        if entry.get("draining"):
+            # Removed by a reload; only here until its running requests finish.
+            name = Text(f"◌ {entry['name']} (draining)", style="dim")
+        elif not healthy:
             name = Text(f"● {entry['name']}", style="bold red")
         elif cooling:
             name = Text(f"● {entry['name']}", style="bold yellow")
@@ -165,6 +169,30 @@ def render(snapshot: dict[str, Any]) -> Group:
             (str(router.get("retries", 0)), "dim"),
         ),
     )
+
+    config = snapshot.get("config") or {}
+    if config.get("error"):
+        # The file on disk is not what is running -- the one thing worth shouting.
+        summary.add_row(
+            "config",
+            Text(
+                f"reload rejected, still on generation {config.get('generation')}: "
+                f"{config['error']}",
+                style="bold red",
+            ),
+        )
+    elif config:
+        loaded_at = config.get("loaded_at")
+        stamp = time.strftime("%H:%M:%S", time.localtime(loaded_at)) if loaded_at else "?"
+        watch = config.get("watch")
+        summary.add_row(
+            "config",
+            Text(
+                f"generation {config.get('generation')} loaded {stamp}"
+                + (f"  ({watch})" if watch else "  (not watching)"),
+                style="dim",
+            ),
+        )
 
     uptime = router.get("uptime_s", 0)
     return Group(

@@ -11,6 +11,7 @@ import uvicorn
 
 from .config import ConfigError, load_config
 from .proxy import Router, create_app
+from .reload import ConfigReloader
 
 
 def _configure_logging(level: str, log_file: str | None) -> None:
@@ -27,9 +28,21 @@ def _configure_logging(level: str, log_file: str | None) -> None:
     )
 
 
-async def _serve(config, tui: bool, log_level: str) -> None:
+async def _serve(
+    config,
+    tui: bool,
+    log_level: str,
+    config_path: str,
+    file_config,
+    watch: bool,
+) -> None:
     router = Router(config)
-    app = create_app(config, router)
+    # SIGHUP is always a reload request -- also with --no-reload, where it is the
+    # only way in -- rather than its default of terminating the process.
+    reloader = ConfigReloader(
+        config_path, router, file_config, watch=watch, handle_sighup=True
+    )
+    app = create_app(config, router, reloader)
 
     server = uvicorn.Server(
         uvicorn.Config(
@@ -85,6 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         "--log-file", help="write logs here instead of stderr (implied by --tui)"
     )
     serve.add_argument("--log-level", default="info")
+    serve.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="don't watch the config file for changes (SIGHUP still reloads)",
+    )
 
     top = sub.add_parser("top", help="attach the dashboard to a running router")
     top.add_argument(
@@ -119,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"capacity={backend.capacity} models={','.join(backend.models)}")
         return 0
 
+    file_config = config
     if args.host:
         config = replace_listen(config, host=args.host)
     if args.port:
@@ -131,7 +150,16 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level, log_file)
 
     try:
-        asyncio.run(_serve(config, tui=args.tui, log_level=args.log_level))
+        asyncio.run(
+            _serve(
+                config,
+                tui=args.tui,
+                log_level=args.log_level,
+                config_path=args.config,
+                file_config=file_config,
+                watch=not args.no_reload,
+            )
+        )
     except KeyboardInterrupt:
         pass
     return 0

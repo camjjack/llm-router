@@ -19,11 +19,16 @@ class TokenUsage:
     `cached_tokens` is the part served from a prefix cache. OpenAI reports it that
     way already; Anthropic splits the prompt across input/cache-read/cache-write,
     so its surface sums them.
+
+    `cached_tokens` is None when the backend said nothing about caching, which is
+    not the same as it saying nothing was cached. vLLM omits the counts entirely
+    unless started with --enable-prompt-tokens-details, and reporting that as a
+    zero hit rate would look exactly like affinity failing.
     """
 
     prompt_tokens: int
     completion_tokens: int = 0
-    cached_tokens: int = 0
+    cached_tokens: int | None = None
 
 
 @dataclass
@@ -63,21 +68,28 @@ class BackendStats:
 
         if not isinstance(prompt, int) or prompt < 0:
             return
-        if not isinstance(cached, int) or cached < 0:
-            cached = 0
-        # Guard against a backend reporting more cached than prompt tokens.
-        cached = min(cached, prompt)
-
         self.prompt_tokens += prompt
-        self.cached_tokens += cached
         if isinstance(completion, int) and completion > 0:
             self.completion_tokens += completion
+
+        # Nothing said about caching: leave the hit rate unknown rather than
+        # recording a zero this request gives no evidence for.
+        if not isinstance(cached, int) or isinstance(cached, bool) or cached < 0:
+            return
+        # Guard against a backend reporting more cached than prompt tokens.
+        cached = min(cached, prompt)
+        self.cached_tokens += cached
         if prompt > 0:
             self.cache_ratios.append(cached / prompt)
 
     @property
     def cache_hit_rate(self) -> float | None:
-        """Mean per-request prefix reuse. The readout for whether affinity is paying."""
+        """Mean per-request prefix reuse. The readout for whether affinity is paying.
+
+        None when no request has reported cache counts at all -- shown as `--`, so
+        a backend that keeps quiet about caching cannot be mistaken for one that
+        never hits its cache.
+        """
         return _mean(self.cache_ratios)
 
     @property
