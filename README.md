@@ -99,6 +99,27 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 }
 ```
 
+### As a systemd service
+
+`llm-router.service.example` is a working unit — copy it to
+`/etc/systemd/system/llm-router.service`, point `ExecStart` at your venv and config, then:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-router
+journalctl -u llm-router -f
+```
+
+Logs reach the journal because the router writes to stderr whenever no `log_file` is set. So leave
+`log_file` out of `config.yaml` and don't pass `--log-file` or `--tui` in the unit, or the journal
+gets nothing. To watch a service that's already running, use `llm-router top --url
+http://127.0.0.1:8080` rather than `--tui`.
+
+`systemctl reload llm-router` sends SIGHUP, which re-reads the config without dropping a single
+session — see below. The router picks up saved edits by itself anyway, so reload mainly matters if
+you run with `--no-reload`, or the config sits on a network filesystem.
+
 ## Changing the config while it runs
 
 Edit `config.yaml` and save. The router picks the change up within a fraction of a second, with no
