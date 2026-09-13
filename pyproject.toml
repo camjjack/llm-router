@@ -1,6 +1,6 @@
 [project]
 name = "llm-router"
-version = "0.1.0"
+version = "0.2.0"
 description = "Capacity-aware, session-sticky load balancing proxy for local LLM backends"
 readme = "README.md"
 requires-python = ">=3.11"
