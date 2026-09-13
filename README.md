@@ -324,6 +324,13 @@ schedules a continuous batch and queues internally *without* the head-of-line bl
 gating necessary for ninfer, so it wants to be saturated. Set `capacity` to `--max-num-seqs` (default
 256). Start it with `--enable-server-load-tracking` and the router will cross-check against `/load`.
 
+Add **`--enable-prompt-tokens-details`** too. Without it vLLM leaves cached-token counts out of its
+usage entirely, on both the OpenAI and the Anthropic surface, so the dashboard's `cache` column shows
+`--` however well its prefix cache is doing. vLLM's own view doesn't depend on the flag — its stats
+log line carries `Prefix cache hit rate`, and `curl http://host:8000/metrics | grep prefix_cache` has
+the counters — so check there if the column stays empty after adding it. Some vLLM versions have bugs
+that keep the field null regardless.
+
 **LM Studio** — `capacity` must match the parallel-request setting in its server UI (it serialises by
 default, in which case use `1`). Newer builds want an auth token; set `api_key: "${LM_API_TOKEN}"`.
 Note that LM Studio's context is whatever you allocated when *loading* the model, not the model's
@@ -335,7 +342,7 @@ maximum — load a 128k model with an 8k context and 8k is what you get.
 |---|---|
 | `load` | In-flight vs capacity. Amber means full — expected under load, not an error. |
 | `pins` | Live sessions pinned to this backend. |
-| `cache` | Mean prefix reuse (`cached_tokens ÷ prompt_tokens`). **The number that tells you affinity is working.** Low on first turns, should climb. |
+| `cache` | Mean prefix reuse (`cached_tokens ÷ prompt_tokens`). **The number that tells you affinity is working.** Low on first turns, should climb. A dim `--` means this backend reports no cache counts at all — not the same as reporting none (see vLLM below). |
 | `err` | Errors. A red `(!n)` counts 429 `server_overloaded` — that means the backend rejected work the router believed it had room for, so its configured `capacity` is too high, or another client is sharing the host. |
 | `spill in` | Requests that landed here because their pinned host was busy. |
 | `ctx` | Discovered context window. A dim `?` means discovery failed — set `context_length`. |

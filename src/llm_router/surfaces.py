@@ -30,6 +30,11 @@ def _int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _int_or_none(value: Any) -> int | None:
+    """Like _int, but keeps "the backend never said" distinct from "it said zero"."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class Surface:
     """Base class; see OpenAISurface and AnthropicSurface."""
 
@@ -109,8 +114,10 @@ class OpenAISurface(Surface):
         prompt = usage.get("prompt_tokens")
         if not isinstance(prompt, int) or isinstance(prompt, bool):
             return None
+        # Absent entirely on vLLM without --enable-prompt-tokens-details, which
+        # means unknown rather than none: see TokenUsage.
         details = usage.get("prompt_tokens_details")
-        cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+        cached = _int_or_none(details.get("cached_tokens")) if isinstance(details, dict) else None
         # OpenAI's prompt_tokens already includes the cached portion.
         return TokenUsage(
             prompt_tokens=prompt,
@@ -177,10 +184,15 @@ class AnthropicSurface(Surface):
         if not isinstance(usage, dict):
             return None
         fresh = usage.get("input_tokens")
-        cache_read = _int(usage.get("cache_read_input_tokens"))
-        cache_write = _int(usage.get("cache_creation_input_tokens"))
+        # Neither field present means the backend reports nothing about caching
+        # (vLLM's Anthropic surface omits both without --enable-prompt-tokens-details),
+        # as opposed to reporting a miss.
+        read = _int_or_none(usage.get("cache_read_input_tokens"))
+        write = _int_or_none(usage.get("cache_creation_input_tokens"))
+        reported = read is not None or write is not None
+        cache_read, cache_write = read or 0, write or 0
         if not isinstance(fresh, int) or isinstance(fresh, bool):
-            if not (cache_read or cache_write):
+            if not reported:
                 return None
             fresh = 0
         # Anthropic's input_tokens EXCLUDES cached tokens, unlike OpenAI's
@@ -189,7 +201,7 @@ class AnthropicSurface(Surface):
         return TokenUsage(
             prompt_tokens=fresh + cache_read + cache_write,
             completion_tokens=_int(usage.get("output_tokens")),
-            cached_tokens=cache_read,
+            cached_tokens=cache_read if reported else None,
         )
 
 
