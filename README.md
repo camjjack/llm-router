@@ -99,6 +99,63 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 }
 ```
 
+## Changing the config while it runs
+
+Edit `config.yaml` and save. The router picks the change up within a fraction of a second, with no
+restart and without breaking the sessions using it:
+
+- **Requests already running finish where they are**, including long streams, even on a backend
+  you just removed. A removed backend shows as `draining` in the dashboard until its last request
+  ends, and takes no new work in the meantime.
+- **Session pins survive** for every backend whose name and URL you didn't change, so agentic loops
+  stay on the host holding their KV. A backend you removed or pointed at a different URL loses its
+  pins, and those sessions re-pin on their next turn.
+- **A bad edit changes nothing.** The file is validated first; if it fails, the running config stays
+  in force, the error is logged, and the dashboard shows it in red until the file is fixed.
+
+### Pointing at a new model
+
+Clients keep sending the model name they were started with, so renaming a model would make them
+404. Alias the old name to the new model in the same edit:
+
+```yaml
+model_aliases:
+  qwen3.6-27b: qwen3.7-32b     # clients still asking for the old name get the new one
+backends:
+  - name: ninfer-a
+    url: http://10.0.0.11:8000
+    capacity: 4
+    models: [qwen3.7-32b]
+```
+
+The router warns in the log if a reload leaves a name that clients used recently resolving to nothing.
+A request already queued for the old model when you save follows the new alias rather than failing.
+
+### What reloads and what doesn't
+
+Everything except `listen` and `log_file`, which are fixed for the life of the process. Changing them
+logs a warning and takes effect on the next restart. A backend's context window is rediscovered when
+its `models`, `upstream_model`, `kind` or `context_length` change.
+
+### How changes are noticed
+
+On Linux the router watches the config's directory with **inotify**. It reacts when a writer *closes*
+the file, so it never reads a half-written one, and it handles editors that save by writing a
+temporary file and renaming it over the original. Symlinked configs work too, including Kubernetes
+ConfigMaps, which update by swapping a `..data` symlink. Elsewhere, and if inotify is unavailable,
+it falls back to one `stat()` every 2 seconds.
+
+To reload by hand, send SIGHUP. It re-applies the file even if it looks unchanged:
+
+```bash
+kill -HUP $(pgrep -f "llm-router serve")
+systemctl reload llm-router     # with ExecReload=/bin/kill -HUP $MAINPID in the unit
+```
+
+`--no-reload` turns file watching off, leaving SIGHUP as the only way to reload. Use it if the config
+sits on a network filesystem, where inotify doesn't see changes made on other machines. `llm-router
+check -c config.yaml` runs the same validation a reload does, so you can test an edit first.
+
 ## Context windows
 
 `/v1/models` advertises each model's usable context, discovered from the backends at startup (and
@@ -285,7 +342,10 @@ maximum — load a 128k model with an 8k context and 8k is what you get.
 | `!n` after the load bar | The backend reports `n` running but we dispatched fewer — something else is using that host, which breaks the capacity gate. Only llama.cpp and vLLM can report this. |
 
 The summary panel shows queue depth, how many requests are holding out for a pinned host, and the
-affinity honor rate — the share of pinned requests that actually got their host.
+affinity honor rate — the share of pinned requests that actually got their host. Its `config` row
+shows which config generation is running. It turns red when a reload has been rejected, meaning the
+file on disk is not what's running. A backend marked `◌ … (draining)` was removed by a reload and
+is finishing its last requests.
 
 If `cache` sits near zero on a long agentic session, affinity isn't sticking: check whether the
 client is rewriting earlier messages (context compaction legitimately breaks the prefix), and whether

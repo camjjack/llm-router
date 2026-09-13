@@ -10,8 +10,10 @@ hosts sit idle.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import itertools
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .config import BackendConfig, HealthConfig
@@ -29,7 +31,10 @@ class QueueTimeout(Exception):
     """Waited past the queue timeout without a slot coming free."""
 
 
-@dataclass
+# Compared by identity, not value: after a config reload two states can share a
+# name (the old host draining, its replacement taking new work), and every lease
+# must go back to the exact one it was granted on.
+@dataclass(eq=False)
 class BackendState:
     config: BackendConfig
     inflight: int = 0
@@ -39,6 +44,9 @@ class BackendState:
     # Monotonic stamp of the last placement, used to break ties between equally
     # loaded backends. See _choose.
     last_assigned: int = 0
+    # Removed from the config (or its URL changed): takes no new work, and is
+    # forgotten once the requests already running on it finish.
+    draining: bool = False
 
     @property
     def name(self) -> str:
@@ -72,19 +80,34 @@ class Lease:
     affinity_honored: bool
     spilled: bool
     queue_wait_s: float
-    _release: object = field(repr=False, default=None)
+    _release: Callable[[BackendState], None] | None = field(repr=False, default=None)
     _released: bool = field(repr=False, default=False)
+    _on_release: list[Callable[[], None]] = field(repr=False, default_factory=list)
 
     @property
     def name(self) -> str:
         return self.backend.name
 
+    def on_release(self, callback: Callable[[], None]) -> None:
+        """Run `callback` when the slot is given back. Ties anything whose lifetime
+        is the request's -- the upstream client it borrowed -- to the one release
+        path that is already known to run exactly once."""
+        if self._released:
+            callback()
+        else:
+            self._on_release.append(callback)
+
     def release(self) -> None:
         if self._released:
             return
         self._released = True
+        # By object rather than by name: a reload may have replaced the backend
+        # of that name since this slot was granted.
         if self._release is not None:
-            self._release(self.backend.name)
+            self._release(self.backend)
+        for callback in self._on_release:
+            callback()
+        self._on_release.clear()
 
 
 @dataclass
@@ -101,6 +124,27 @@ class _Waiter:
     unavailable_deadline: float = 0.0
 
 
+@dataclass
+class BackendDiff:
+    """What a reconfigure did, by backend name."""
+
+    added: list[str] = field(default_factory=list)
+    # Gone from the config; draining whatever was already running on them.
+    removed: list[str] = field(default_factory=list)
+    # Same name, different URL -- a different host. The old one drains.
+    replaced: list[str] = field(default_factory=list)
+    # Same host, some other setting changed; name -> the fields that changed.
+    updated: dict[str, list[str]] = field(default_factory=dict)
+
+
+def _changed_fields(old: BackendConfig, new: BackendConfig) -> list[str]:
+    return [
+        f.name
+        for f in dataclasses.fields(BackendConfig)
+        if getattr(old, f.name) != getattr(new, f.name)
+    ]
+
+
 class Scheduler:
     def __init__(
         self,
@@ -110,6 +154,10 @@ class Scheduler:
         self.backends: dict[str, BackendState] = {
             b.name: BackendState(config=b) for b in backends
         }
+        # States taken out of rotation by a reload, still finishing their work.
+        self.draining: list[BackendState] = []
+        # Called with each draining state once its last request has finished.
+        self.on_drained: Callable[[BackendState], None] | None = None
         self._health = health or HealthConfig()
         self._waiters: list[_Waiter] = []
         self._seq = itertools.count()
@@ -136,6 +184,97 @@ class Scheduler:
             await asyncio.sleep(PUMP_INTERVAL_S)
             if self._waiters:
                 self._pump()
+
+    # ------------------------------------------------------------- reconfigure
+
+    def reconfigure(
+        self, backends: tuple[BackendConfig, ...], health: HealthConfig
+    ) -> BackendDiff:
+        """Swap in a new backend list without disturbing work already running.
+
+        Synchronous on purpose, so no request can observe a half-applied config.
+        A backend whose name and URL are unchanged keeps its state -- in-flight
+        count, health, cooldown -- and simply takes the new settings. One that is
+        gone, or now points at a different host, drains: requests already running
+        on it finish where they are, and it is given nothing new.
+        """
+        diff = BackendDiff()
+        old = self.backends
+        new: dict[str, BackendState] = {}
+        retired: list[BackendState] = []
+        for config in backends:
+            state = old.get(config.name)
+            if state is None:
+                diff.added.append(config.name)
+                new[config.name] = self._joining(config)
+            elif state.config.url != config.url:
+                diff.replaced.append(config.name)
+                retired.append(state)
+                new[config.name] = self._joining(config)
+            else:
+                changed = _changed_fields(state.config, config)
+                if changed:
+                    diff.updated[config.name] = changed
+                    # A capacity cut below the current in-flight count needs no
+                    # special case: `free` stays at zero until enough work drains.
+                    state.config = config
+                new[config.name] = state
+        for name, state in old.items():
+            if name not in new:
+                diff.removed.append(name)
+                retired.append(state)
+
+        self.backends = new
+        self._health = health
+        # After the swap, so an on_drained callback sees the new backend table.
+        for state in retired:
+            self._retire(state)
+
+        gone = set(diff.removed) | set(diff.replaced)
+        for waiter in list(self._waiters):
+            if waiter.preferred in gone:
+                # Pinned to a host that is no longer there: nothing to hold out for.
+                waiter.preferred = None
+            if not any(b.serves(waiter.model) for b in new.values()):
+                # The model itself is gone. Fail now rather than after the grace
+                # period, so the caller can re-resolve it against the new aliases.
+                self._drop(waiter)
+                if not waiter.future.done():
+                    waiter.future.set_exception(
+                        NoBackendError(f"model '{waiter.model}' is no longer configured")
+                    )
+
+        # Capacity may have grown, or a backend may now serve a queued model.
+        self._pump()
+        return diff
+
+    def _joining(self, config: BackendConfig) -> BackendState:
+        """State for a backend (re)joining the rotation.
+
+        If a reload took this same host out moments ago -- a backend commented out
+        and straight back in -- and it is still finishing that work, pick the old
+        state back up. Its in-flight requests are real load on that host; starting
+        from zero would let the capacity gate hand it more than it can take.
+        """
+        for state in self.draining:
+            if state.name == config.name and state.config.url == config.url:
+                self.draining.remove(state)
+                state.draining = False
+                state.config = config
+                return state
+        # Unproven until probed; the caller probes straight away.
+        return BackendState(config=config, healthy=False)
+
+    def _retire(self, state: BackendState) -> None:
+        state.draining = True
+        if state.inflight > 0:
+            self.draining.append(state)
+        else:
+            self._drained(state)
+
+    def _drained(self, state: BackendState) -> None:
+        if self.on_drained is not None:
+            self.on_drained(state)
 
     # ----------------------------------------------------------------- acquire
 
@@ -295,18 +434,28 @@ class Scheduler:
 
     # ----------------------------------------------------------------- release
 
-    def release(self, name: str) -> None:
-        state = self.backends.get(name)
-        if state is None:
-            return
+    def release(self, state: BackendState) -> None:
         if state.inflight > 0:
             state.inflight -= 1
+        if state.draining:
+            # Frees nothing anyone can use. Just notice when it is empty.
+            if state.inflight == 0 and state in self.draining:
+                self.draining.remove(state)
+                self._drained(state)
+            return
         self._pump()
 
     # ------------------------------------------------------------------ health
 
-    def note_success(self, name: str) -> None:
-        state = self.backends.get(name)
+    def _state(self, target: BackendState | str) -> BackendState | None:
+        """Accept the state itself, which is exact even across a reload, or a name
+        (tests, and callers that only ever deal with the live config)."""
+        if isinstance(target, BackendState):
+            return target
+        return self.backends.get(target)
+
+    def note_success(self, target: BackendState | str) -> None:
+        state = self._state(target)
         if state is None:
             return
         state.consecutive_failures = 0
@@ -315,9 +464,9 @@ class Scheduler:
             state.healthy = True
             self._pump()
 
-    def note_failure(self, name: str) -> None:
+    def note_failure(self, target: BackendState | str) -> None:
         """Passive failure seen while serving a request: back the backend off."""
-        state = self.backends.get(name)
+        state = self._state(target)
         if state is None:
             return
         state.consecutive_failures += 1
@@ -329,9 +478,9 @@ class Scheduler:
         if state.consecutive_failures >= self._health.failure_threshold:
             state.healthy = False
 
-    def set_healthy(self, name: str, healthy: bool) -> None:
+    def set_healthy(self, target: BackendState | str, healthy: bool) -> None:
         """Result of an active probe."""
-        state = self.backends.get(name)
+        state = self._state(target)
         if state is None:
             return
         was = state.healthy
