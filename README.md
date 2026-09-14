@@ -101,11 +101,52 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ### As a systemd service
 
-`llm-router.service.example` is a working unit — copy it to
-`/etc/systemd/system/llm-router.service`, point `ExecStart` at your venv and config, then:
+`llm-router.service.example` is a working unit. It expects a venv at `/opt/llm-router/venv` and a
+config at `/etc/llm-router/config.yaml`; run these from a checkout to build that:
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router
+# the service account. It only ever runs the venv -- it installs nothing.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router  # RHEL: /sbin/nologin
+
+# build the venv as yourself, then hand it to root
+sudo install -d -m 0755 -o "$USER" -g "$USER" /opt/llm-router
+uv venv --python /usr/bin/python3 --python-preference only-system /opt/llm-router/venv
+uv pip install --link-mode=copy --python /opt/llm-router/venv/bin/python .
+sudo chown -R root:root /opt/llm-router
+
+# config: readable by the service account, not by everyone
+sudo install -d -m 0755 /etc/llm-router
+sudo install -m 0640 -o root -g llm-router config.example.yaml /etc/llm-router/config.yaml
+sudo install -m 0640 -o root -g llm-router /dev/null /etc/llm-router/env  # optional ${VAR} secrets
+sudoedit /etc/llm-router/config.yaml
+```
+
+Two details that bite:
+
+- **Build the venv on `/usr/bin/python3`.** Left to itself, `uv venv` may point it at a uv-managed
+  interpreter inside your home directory. The unit sets `ProtectHome=yes`, so the service then fails
+  to start with an error that never mentions the interpreter. Confirm with `readlink -f
+  /opt/llm-router/venv/bin/python`; if the answer is under `/home` or `/root`, rebuild it.
+- **`--link-mode=copy`.** uv hardlinks out of its cache in your home by default, which would leave
+  the service's code writable by you after the chown.
+
+Installing as yourself rather than as root also keeps your own package index configuration in play.
+If you do install as root, note that root does not read your `~/.config/uv/uv.toml`, and that **uv
+ignores `pip.conf` entirely** — so pass `--index-url`, or `sudo env
+UV_CONFIG_FILE="$HOME/.config/uv/uv.toml" …`, or put the file at `/etc/uv/uv.toml` (mode `0600` if it
+embeds a token).
+
+Now check it exactly as systemd will run it. This one command proves the config is valid, that the
+service account can read it, and that it can execute the venv — before systemd is involved at all:
+
+```bash
+sudo -u llm-router /opt/llm-router/venv/bin/llm-router check -c /etc/llm-router/config.yaml
+```
+
+Then start it:
+
+```bash
+sudo cp llm-router.service.example /etc/systemd/system/llm-router.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now llm-router
 journalctl -u llm-router -f
@@ -119,6 +160,16 @@ http://127.0.0.1:8080` rather than `--tui`.
 `systemctl reload llm-router` sends SIGHUP, which re-reads the config without dropping a single
 session — see below. The router picks up saved edits by itself anyway, so reload mainly matters if
 you run with `--no-reload`, or the config sits on a network filesystem.
+
+Upgrading is a restart, not a reload, since reload only re-reads the config. The venv belongs to root
+by then, so take it back for the install:
+
+```bash
+sudo chown -R "$USER" /opt/llm-router
+uv pip install --link-mode=copy --upgrade --python /opt/llm-router/venv/bin/python .
+sudo chown -R root:root /opt/llm-router
+sudo systemctl restart llm-router
+```
 
 ## Changing the config while it runs
 
