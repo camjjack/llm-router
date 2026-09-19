@@ -47,6 +47,11 @@ class BackendState:
     # Removed from the config (or its URL changed): takes no new work, and is
     # forgotten once the requests already running on it finish.
     draining: bool = False
+    # Seconds this backend has spent full with requests queued for a model it
+    # serves. A request's share of it is what its session cost everyone else.
+    contended_s: float = 0.0
+    # Whether that is true right now; see Scheduler._account.
+    contended: bool = False
 
     @property
     def name(self) -> str:
@@ -160,6 +165,9 @@ class Scheduler:
         self.on_drained: Callable[[BackendState], None] | None = None
         self._health = health or HealthConfig()
         self._waiters: list[_Waiter] = []
+        # Queued requests per model, so contention is a lookup rather than a scan.
+        self._waiting: dict[str, int] = {}
+        self._accounted_at = time.monotonic()
         self._seq = itertools.count()
         self._placements = itertools.count(1)
         self._pump_task: asyncio.Task | None = None
@@ -198,6 +206,7 @@ class Scheduler:
         gone, or now points at a different host, drains: requests already running
         on it finish where they are, and it is given nothing new.
         """
+        self._account()
         diff = BackendDiff()
         old = self.backends
         new: dict[str, BackendState] = {}
@@ -310,6 +319,7 @@ class Scheduler:
             unavailable_deadline=now + unavailable_grace_s,
         )
         self._waiters.append(waiter)
+        self._waiting[model] = self._waiting.get(model, 0) + 1
 
         # Fast path: placement is synchronous, so an idle pool never touches the queue.
         self._pump()
@@ -336,7 +346,44 @@ class Scheduler:
         try:
             self._waiters.remove(waiter)
         except ValueError:
-            pass
+            return
+        remaining = self._waiting.get(waiter.model, 1) - 1
+        if remaining > 0:
+            self._waiting[waiter.model] = remaining
+        else:
+            self._waiting.pop(waiter.model, None)
+        self._account()
+
+    # ------------------------------------------------------- queue contention
+
+    def _account(self) -> None:
+        """Advance each backend's contended-time clock, then re-read the state.
+
+        A backend is contended while it is full and something is queued for a
+        model it serves: every request holding one of its slots is keeping that
+        queue waiting. Called after anything that can change either side of
+        that, so the flag set last time covers the whole interval since.
+        """
+        now = time.monotonic()
+        elapsed = now - self._accounted_at
+        self._accounted_at = now
+        waiting = self._waiting
+        for state in self.backends.values():
+            if state.contended:
+                state.contended_s += elapsed
+            state.contended = state.free == 0 and any(
+                model in waiting for model in state.config.models
+            )
+
+    def contended_seconds(self, state: BackendState) -> float:
+        """Its contended time, including the stretch in progress."""
+        if not state.contended:
+            return state.contended_s
+        return state.contended_s + (time.monotonic() - self._accounted_at)
+
+    def waiting_for(self, state: BackendState) -> int:
+        """Requests queued for a model this backend serves."""
+        return sum(self._waiting.get(model, 0) for model in state.config.models)
 
     # ------------------------------------------------------------------- pump
 
@@ -388,6 +435,7 @@ class Scheduler:
                     _release=self.release,
                 )
             )
+        self._account()
 
     def _candidates(self, waiter: _Waiter, now: float) -> list[BackendState]:
         """Backends that are up, serve this model, and have not already failed it."""
@@ -444,6 +492,7 @@ class Scheduler:
                 self._drained(state)
             return
         self._pump()
+        self._account()
 
     # ------------------------------------------------------------------ health
 

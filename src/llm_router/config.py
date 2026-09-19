@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import yaml
 
 from .affinity import DEFAULT_SESSION_HEADERS
+from .tracking import DEFAULT_USER_HEADERS
 
 # Backend engines we know how to probe. They differ in where they publish context
 # length and load, and in whether they want to be saturated -- see BackendConfig.
@@ -129,6 +131,68 @@ class TimeoutConfig:
 
 
 @dataclass(frozen=True)
+class TrackingConfig:
+    """Per-user session tracking, shown at /dashboard."""
+
+    enabled: bool = True
+    # Request headers naming the user, tried in order. With none of them present
+    # a user is known by the address they connect from.
+    user_headers: tuple[str, ...] = DEFAULT_USER_HEADERS
+    # An in-flight request that has had nothing back for this long is flagged
+    # slow, and at stuck_after_s, stuck. "Nothing back" is time since its last
+    # response byte, or since it arrived if none has come yet.
+    slow_after_s: float = 15.0
+    stuck_after_s: float = 60.0
+    # How long an idle session stays listed.
+    retain_s: float = 3600.0
+    # Most sessions remembered; beyond it the longest-idle go first.
+    max_sessions: int = 2000
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """What coding agents are told about one model. Everything is optional."""
+
+    # Display name. The model's id is what clients send; this is what they show.
+    name: str | None = None
+    tool_call: bool = True
+    reasoning: bool = False
+    # Accepts images as input.
+    images: bool = False
+    # The window clients should assume. Normally the router discovers it from the
+    # backends; set this to tell clients less (to keep long sessions quicker, say),
+    # or to fill in a window that can't be discovered. Never more than the
+    # backends really serve: a larger value is capped, with a warning.
+    context_length: int | None = None
+    max_output_tokens: int | None = None
+    # Extra request-body fields clients should send with every request, such as
+    # reasoning_effort or chat_template_kwargs.
+    request_params: dict[str, Any] = field(default_factory=dict)
+    # Effort levels the model accepts, for clients that let you switch between
+    # them (opencode's variants). request_params.reasoning_effort is the default.
+    reasoning_efforts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClientsConfig:
+    """How the router describes itself in the client configs it generates."""
+
+    # The URL clients should use, without /v1. Left unset, each config uses the
+    # URL it was fetched from, which is right unless it was fetched as localhost.
+    base_url: str | None = None
+    # The provider's id and name in clients that group models by provider.
+    provider_id: str = "llm-router"
+    provider_name: str = "llm-router"
+    # The router doesn't check it, but most clients insist on having one.
+    api_key: str = "unused"
+    # The model clients start on. Defaults to the first model in the config.
+    default_model: str | None = None
+    # For background work: titles, summaries, commit messages. Clients use
+    # their own default when this is unset.
+    small_model: str | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     backends: tuple[BackendConfig, ...]
     # Maps a requested model name onto a configured one. A "*" key is a catch-all
@@ -139,6 +203,10 @@ class Config:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
+    # Per-model metadata for client configs, keyed by served model name.
+    models: dict[str, ModelConfig] = field(default_factory=dict)
+    clients: ClientsConfig = field(default_factory=ClientsConfig)
     host: str = "0.0.0.0"
     port: int = 8080
     log_file: str | None = None
@@ -183,14 +251,16 @@ def _section(raw: dict[str, Any], key: str, cls: type) -> Any:
             f"Valid keys: {', '.join(sorted(known))}"
         )
     data = dict(data)
-    if "session_headers" in data:
-        value = data["session_headers"]
+    for name in ("session_headers", "user_headers"):
+        if name not in data:
+            continue
+        value = data[name]
         if isinstance(value, str):
             value = [value]
         if not isinstance(value, list):
-            raise ConfigError("routing.session_headers must be a list of header names")
+            raise ConfigError(f"{key}.{name} must be a list of header names")
         # Header lookups are lowercase; normalise so config casing does not matter.
-        data["session_headers"] = tuple(str(v).lower() for v in value)
+        data[name] = tuple(str(v).lower() for v in value)
     return cls(**data)
 
 
@@ -256,6 +326,105 @@ def _parse_backend(raw: Any, index: int) -> BackendConfig:
     )
 
 
+def _parse_tracking(raw: dict[str, Any]) -> TrackingConfig:
+    tracking = _section(raw, "tracking", TrackingConfig)
+    if not isinstance(tracking.enabled, bool):
+        raise ConfigError("tracking.enabled must be true or false")
+    for name in ("slow_after_s", "stuck_after_s", "retain_s"):
+        value = getattr(tracking, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(f"tracking.{name} must be a positive number of seconds")
+    if tracking.slow_after_s > tracking.stuck_after_s:
+        raise ConfigError("tracking.slow_after_s must not exceed tracking.stuck_after_s")
+    limit = tracking.max_sessions
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ConfigError("tracking.max_sessions must be an integer >= 1")
+    return tracking
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _parse_models(raw: dict[str, Any], served: set[str]) -> dict[str, ModelConfig]:
+    section = raw.get("models") or {}
+    if not isinstance(section, dict):
+        raise ConfigError("'models' must be a mapping of model name -> settings")
+    known = {f.name for f in ModelConfig.__dataclass_fields__.values()}
+    models: dict[str, ModelConfig] = {}
+    for name, entry in section.items():
+        name = str(name)
+        where = f"models['{name}']"
+        if name not in served:
+            raise ConfigError(
+                f"{where}: no backend serves a model of that name "
+                f"(known: {', '.join(sorted(served))})"
+            )
+        entry = entry or {}
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} must be a mapping")
+        unknown = set(entry) - known
+        if unknown:
+            raise ConfigError(
+                f"unknown key(s) in {where}: {', '.join(sorted(unknown))}. "
+                f"Valid keys: {', '.join(sorted(known))}"
+            )
+        if "reasoning_efforts" in entry:
+            efforts = entry["reasoning_efforts"]
+            if not isinstance(efforts, list) or not all(isinstance(e, str) for e in efforts):
+                raise ConfigError(f"{where}.reasoning_efforts must be a list of names")
+            entry = {**entry, "reasoning_efforts": tuple(efforts)}
+        model = ModelConfig(**entry)
+        if model.name is not None and not isinstance(model.name, str):
+            raise ConfigError(f"{where}.name must be a string")
+        for flag in ("tool_call", "reasoning", "images"):
+            if not isinstance(getattr(model, flag), bool):
+                raise ConfigError(f"{where}.{flag} must be true or false")
+        for limit in ("context_length", "max_output_tokens"):
+            value = getattr(model, limit)
+            if value is not None and not _positive_int(value):
+                raise ConfigError(f"{where}.{limit} must be a positive integer")
+        if not isinstance(model.request_params, dict):
+            raise ConfigError(f"{where}.request_params must be a mapping")
+        models[name] = model
+    return models
+
+
+PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _parse_clients(raw: dict[str, Any], served: set[str]) -> ClientsConfig:
+    clients = _section(raw, "clients", ClientsConfig)
+    if not PROVIDER_ID.match(str(clients.provider_id)):
+        # Clients turn it into an environment variable name (GLM53_API_KEY), so
+        # it has to survive that.
+        raise ConfigError(
+            "clients.provider_id may contain only letters, digits, '-' and '_'"
+        )
+    for key in ("default_model", "small_model"):
+        value = getattr(clients, key)
+        if value is not None and value not in served:
+            raise ConfigError(
+                f"clients.{key} '{value}' is not served by any backend "
+                f"(known: {', '.join(sorted(served))})"
+            )
+    base_url = clients.base_url
+    if base_url is not None:
+        base_url = str(base_url).rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise ConfigError("clients.base_url must start with http:// or https://")
+        # Clients add /v1 themselves where they need it; accept it written either way.
+        base_url = base_url.removesuffix("/v1")
+    return ClientsConfig(
+        base_url=base_url,
+        provider_id=str(clients.provider_id),
+        provider_name=str(clients.provider_name),
+        api_key=str(clients.api_key),
+        default_model=clients.default_model,
+        small_model=clients.small_model,
+    )
+
+
 def load_config(path: str | Path) -> Config:
     path = Path(path)
     if not path.exists():
@@ -312,6 +481,9 @@ def parse_config(text: str) -> Config:
         routing=_section(raw, "routing", RoutingConfig),
         health=_section(raw, "health", HealthConfig),
         timeouts=_section(raw, "timeouts", TimeoutConfig),
+        tracking=_parse_tracking(raw),
+        models=_parse_models(raw, known),
+        clients=_parse_clients(raw, known),
         host=str(listen.get("host", "0.0.0.0")),
         port=int(listen.get("port", 8080)),
         log_file=(str(raw["log_file"]) if raw.get("log_file") else None),

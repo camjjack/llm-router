@@ -38,6 +38,37 @@ health:
   timeout_s: 3
   failure_threshold: 2
 
+# What coding agents are told about each model, for the ready-made configs at
+# http://<router>/connect. All optional: without it, clients get every model with
+# its discovered context. See "Connecting coding agents" in the README.
+# models:
+#   qwen3.6-27b:
+#     name: Qwen 3.6 27B
+#     reasoning: true
+#     context_length: 65536        # tell clients less than the backends serve
+#     max_output_tokens: 16384
+#     request_params:              # extra request-body fields clients should send
+#       chat_template_kwargs: {enable_thinking: true}
+#
+# clients:
+#   provider_id: llm-router
+#   provider_name: llm-router
+#   default_model: qwen3.6-27b
+#   base_url: http://10.0.0.1:8080  # default: the address the config was fetched from
+
+# Per-user session tracking, shown at http://<router>/dashboard. Users are named
+# by Open WebUI's forwarded headers (ENABLE_FORWARD_USER_INFO_HEADERS=true) or an
+# X-LLM-Router-User header, and otherwise by address. All optional; the defaults
+# are shown.
+tracking:
+  enabled: true
+  # A request that has heard nothing back for this long is flagged slow, then stuck.
+  slow_after_s: 15
+  stuck_after_s: 60
+  # How long an idle session stays listed, and the most sessions remembered.
+  retain_s: 3600
+  max_sessions: 2000
+
 # Map requested model names onto configured ones. Claude Code sends whatever
 # ANTHROPIC_MODEL is set to, and *also* issues background requests for its
 # small/fast model (summarisation, commit messages). Without an entry for those,

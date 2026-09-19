@@ -18,6 +18,8 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 | `POST /v1/messages` | Claude Code (also `?beta=true`) |
 | `POST /v1/messages/count_tokens` | Claude Code token accounting |
 | `GET /v1/models`, `GET /health`, `GET /stats` | discovery, liveness, telemetry |
+| `GET /dashboard`, `GET /sessions` | who is using it, and what is stuck — see [the web dashboard](#sessions-and-users-the-web-dashboard) |
+| `GET /connect`, `GET /clients/<name>` | ready-made configs for opencode, Claude Code, Qwen Code and Zed — see [connecting coding agents](#connecting-coding-agents) |
 
 | `kind` | Liveness | Load telemetry | Context from | Capacity should match |
 |---|---|---|---|---|
@@ -101,11 +103,52 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ### As a systemd service
 
-`llm-router.service.example` is a working unit — copy it to
-`/etc/systemd/system/llm-router.service`, point `ExecStart` at your venv and config, then:
+`llm-router.service.example` is a working unit. It expects a venv at `/opt/llm-router/venv` and a
+config at `/etc/llm-router/config.yaml`; run these from a checkout to build that:
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router
+# the service account. It only ever runs the venv -- it installs nothing.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin llm-router  # RHEL: /sbin/nologin
+
+# build the venv as yourself, then hand it to root
+sudo install -d -m 0755 -o "$USER" -g "$USER" /opt/llm-router
+uv venv --python /usr/bin/python3 --python-preference only-system /opt/llm-router/venv
+uv pip install --link-mode=copy --python /opt/llm-router/venv/bin/python .
+sudo chown -R root:root /opt/llm-router
+
+# config: readable by the service account, not by everyone
+sudo install -d -m 0755 /etc/llm-router
+sudo install -m 0640 -o root -g llm-router config.example.yaml /etc/llm-router/config.yaml
+sudo install -m 0640 -o root -g llm-router /dev/null /etc/llm-router/env  # optional ${VAR} secrets
+sudoedit /etc/llm-router/config.yaml
+```
+
+Two details that bite:
+
+- **Build the venv on `/usr/bin/python3`.** Left to itself, `uv venv` may point it at a uv-managed
+  interpreter inside your home directory. The unit sets `ProtectHome=yes`, so the service then fails
+  to start with an error that never mentions the interpreter. Confirm with `readlink -f
+  /opt/llm-router/venv/bin/python`; if the answer is under `/home` or `/root`, rebuild it.
+- **`--link-mode=copy`.** uv hardlinks out of its cache in your home by default, which would leave
+  the service's code writable by you after the chown.
+
+Installing as yourself rather than as root also keeps your own package index configuration in play.
+If you do install as root, note that root does not read your `~/.config/uv/uv.toml`, and that **uv
+ignores `pip.conf` entirely** — so pass `--index-url`, or `sudo env
+UV_CONFIG_FILE="$HOME/.config/uv/uv.toml" …`, or put the file at `/etc/uv/uv.toml` (mode `0600` if it
+embeds a token).
+
+Now check it exactly as systemd will run it. This one command proves the config is valid, that the
+service account can read it, and that it can execute the venv — before systemd is involved at all:
+
+```bash
+sudo -u llm-router /opt/llm-router/venv/bin/llm-router check -c /etc/llm-router/config.yaml
+```
+
+Then start it:
+
+```bash
+sudo cp llm-router.service.example /etc/systemd/system/llm-router.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now llm-router
 journalctl -u llm-router -f
@@ -119,6 +162,16 @@ http://127.0.0.1:8080` rather than `--tui`.
 `systemctl reload llm-router` sends SIGHUP, which re-reads the config without dropping a single
 session — see below. The router picks up saved edits by itself anyway, so reload mainly matters if
 you run with `--no-reload`, or the config sits on a network filesystem.
+
+Upgrading is a restart, not a reload, since reload only re-reads the config. The venv belongs to root
+by then, so take it back for the install:
+
+```bash
+sudo chown -R "$USER" /opt/llm-router
+uv pip install --link-mode=copy --upgrade --python /opt/llm-router/venv/bin/python .
+sudo chown -R root:root /opt/llm-router
+sudo systemctl restart llm-router
+```
 
 ## Changing the config while it runs
 
@@ -214,22 +267,110 @@ Override per backend with `context_length:` when a host lies or publishes nothin
 ### opencode needs telling separately
 
 opencode pulls context limits from models.dev for known providers and from your own config for
-custom ones — it does **not** read them from `/v1/models`. So set them explicitly, matching what
-`curl http://127.0.0.1:8080/v1/models` reports:
+custom ones — it does **not** read them from `/v1/models`. The config the router generates for it
+carries them, so this is taken care of; see [connecting coding agents](#connecting-coding-agents).
 
-```json
-{
-  "provider": {
-    "local": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
-      "models": {
-        "qwen3.6-27b": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
+To tell clients a smaller window than the backends serve (a long session is quicker, and many
+models do worse near the end of their window), set it per model:
+
+```yaml
+models:
+  qwen3.6-27b:
+    context_length: 32768     # never more than the backends serve: that is capped, with a warning
 ```
+
+`/v1/models` and every generated client config then advertise 32768.
+
+## Connecting coding agents
+
+Open `http://<router>:8080/connect`. It has a ready-made config for **opencode**, **Claude Code**,
+**Qwen Code** and **Zed**, with where it goes and how to install it, generated from the router's own
+config. Each client is told the model ids, the context and output each model takes, the request
+fields a model wants, and timeouts long enough for the router's queue. Type your name in and each
+config also carries the header the [session dashboard](#sessions-and-users-the-web-dashboard) shows
+you by.
+
+The same configs are plain files, for scripts:
+
+```bash
+curl -s http://router:8080/clients/opencode          # also claude-code, qwen-code, zed
+curl -s 'http://router:8080/clients/claude-code?user=alice&model=glm-air'
+curl -s 'http://router:8080/clients/claude-code?format=shell'   # export lines instead of JSON
+curl -s http://router:8080/clients                   # all of them, with install steps, as JSON
+```
+
+**opencode can keep itself up to date.** Log in to the router once:
+
+```bash
+opencode auth login http://router:8080          # or http://router:8080/u/alice, to be named
+```
+
+and opencode fetches its config from the router's `/.well-known/opencode` every time it starts,
+layered underneath your own settings. Change a model in the router's config and every opencode
+logged in to it follows. The other clients need their config fetched again.
+
+### Describing the models
+
+Everything is optional. Without it, clients still get every model with its discovered context.
+
+```yaml
+models:
+  GLM-5.3-Flash-EXL3:
+    name: GLM-5.3 Flash EXL3          # what clients display
+    tool_call: true                   # default true
+    reasoning: true                   # default false
+    images: false                     # default false
+    context_length: 200000            # tell clients less than the backends serve
+    max_output_tokens: 32768
+    reasoning_efforts: [low, high, max]   # levels to switch between, where a client can
+    request_params:                   # extra request-body fields clients should send
+      reasoning_effort: high          # the default effort
+      chat_template_kwargs: {clear_thinking: true}
+
+clients:
+  provider_id: glm53                  # default llm-router
+  provider_name: GLM-5.3 Flash EXL3 (Sparks)
+  default_model: GLM-5.3-Flash-EXL3   # default: the first model in the config
+  small_model: GLM-5.3-Flash-EXL3     # titles, summaries, commit messages; unset = client default
+  # base_url: http://10.0.0.1:8888    # default: the address the config was fetched from
+  # api_key: unused                   # the router ignores it, but clients insist on one
+```
+
+`base_url` needs setting only if people reach the router at a different address than the one the
+config is fetched from. That happens when it's fetched as `localhost` on the router's own host, or
+from behind a proxy.
+
+### Where the numbers come from
+
+- **Context** is what the backends report, capped by `context_length`. An unknown window is left
+  out, with a warning on the connect page, rather than guessed.
+- **How long to wait for a response to start** is `queue_timeout_s + first_byte_s`: the longest a
+  request can sit in the router's queue, plus the longest it waits for its backend. With the
+  defaults that's 900s, more than several clients wait by themselves: opencode gives up after
+  300s, and Claude Code after 600s.
+- **How long a response may go quiet** is `first_byte_s`. With vLLM and llama.cpp a response's
+  headers arrive at once and prefill happens before its first chunk, so a long prefill counts
+  against this. opencode's own limit is 300s, and Claude Code's stream watchdog fires after two
+  minutes.
+
+### What each client gets
+
+These were checked by running each client against the router and looking at what arrived, which
+turned up more than the documentation did:
+
+- **opencode** ignores `reasoning_effort` in a model's `options`, silently. Effort is a *variant*,
+  so each effort level becomes one, the configured effort becomes the default, and `--variant max`
+  (or the variant key in the TUI) switches. opencode uses the lowest variant for titles. Other
+  `request_params` go in `options` and are sent. It asks for at most 32,000 output tokens, whatever
+  the limit says.
+- **Claude Code** gets its `opus`, `sonnet` and `fable` aliases mapped to `default_model`, and
+  `haiku`, its background model, to `small_model`. One further model fits in the `/model` picker.
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells it when to compact. It can't send `request_params`, and it
+  needs backends that speak the Anthropic Messages API.
+- **Qwen Code** sends `request_params` with every request, as `extra_body`.
+- **Zed** sends `reasoning_effort` but no other `request_params`. It keeps API keys out of
+  `settings.json`, so it reads `<PROVIDER_ID>_API_KEY` (for example `GLM53_API_KEY`) from the
+  environment.
 
 ## Claude Code
 
@@ -310,6 +451,10 @@ inference in one specific way: it survives a user **editing or regenerating** an
 where the prompt prefix legitimately changes but the conversation has not, so the chat stays on the
 host that still holds most of its KV.
 
+The same setting sends the user's name and email, which the
+[web dashboard](#sessions-and-users-the-web-dashboard) uses to show each person's chats and whether
+any of them are stuck.
+
 Check it is working in the dashboard's `identity` row, or:
 
 ```bash
@@ -318,7 +463,8 @@ curl -s localhost:8080/stats | jq '.router | {keys_from_header, keys_from_prefix
 
 ### Why chat id and not user id
 
-Open WebUI also forwards `X-OpenWebUI-User-Id`, and the router **deliberately ignores it**. Pinning
+Open WebUI also forwards `X-OpenWebUI-User-Id`, and routing **deliberately ignores it** (the web
+dashboard reads it, but only to label things). Pinning
 per user would pile all of one person's chats onto a single host: worse for balance, and no better
 for cache reuse than pinning each chat separately. Identity is not the unit of KV locality — a
 conversation is. There is a test asserting the user headers never form a pin.
@@ -379,6 +525,130 @@ If `cache` sits near zero on a long agentic session, affinity isn't sticking: ch
 client is rewriting earlier messages (context compaction legitimately breaks the prefix), and whether
 `affinity_wait_ms` is long enough for your pool.
 
+## Sessions and users: the web dashboard
+
+Open `http://127.0.0.1:8080/dashboard` in a browser. It shows who is using the router, what each of
+their sessions is doing right now, and anything that has stopped getting answers:
+
+- **In flight**: every request the router is holding, in its current state, with how long the
+  client has been waiting and how long it has been since anything came back.
+- **Users**: each person, their clients, sessions, errors and tokens. Select one to see only their
+  sessions.
+- **Sessions**: the conversations themselves. Expand one to see its last few requests: which
+  subagent sent each, where it ran, how long it queued, time to first token, and tokens used.
+- **Recent requests**: the last 50 to finish, which can be filtered to errors only.
+
+Each request also shows **what it asked the model for** — reasoning effort, thinking and its
+budget, and the output limit — and **how long it held a backend**, with how much of that other
+requests spent queued behind it. That is what finds the session everyone else is waiting on. Sort
+the sessions by *Made others wait*, and see the same totals per person in the users table, next to
+how long their own requests were queued.
+
+`reasoning_effort`, Anthropic's `thinking` block, `output_config.effort` and the
+`chat_template_kwargs` that vLLM and llama.cpp hand to the chat template are all read, so it does
+not matter which spelling a client uses. A model's own default applies when a request says nothing,
+and the dashboard shows that as `default`. Where a backend reports reasoning tokens separately,
+those are counted too.
+
+| State | Meaning |
+|---|---|
+| `queued` | Waiting for a free slot on any backend. |
+| `holding` | Waiting for the backend its session is pinned to, to reuse the prompt cache there. It spills elsewhere once `affinity_wait_ms` runs out. |
+| `processing` | Sent to a backend, nothing back yet: prefill, or the whole of a reply that isn't streamed. |
+| `streaming` | Tokens are arriving. |
+| `idle` (sessions only) | Nothing in flight. The session is waiting on its client, not on the router. |
+
+**Made others wait** is time a request held a slot on a **full** backend while something was queued
+for a model that backend serves. Every request holding one of its slots is charged that time, since
+each of them is equally in the way. A busy backend with nobody queued costs nobody anything, so it
+counts as zero.
+
+**Slow and stuck are measured on silence:** the time since the last byte came back, or since the
+request arrived if none has. A long reply that is still producing tokens is never stuck. A request
+queued for a minute, a prefill that hasn't produced a first token, or a stream that stopped
+mid-reply, is. Slow is 15s and stuck 60s by default, and stuck requests sort to the top.
+
+### How users are identified
+
+In this order:
+
+1. **Open WebUI**, started with `ENABLE_FORWARD_USER_INFO_HEADERS=true`, which sends each user's
+   email, id and name. With the same setting its chat id identifies each session exactly.
+2. **An `X-LLM-Router-User` header**, for coding agents on people's own machines:
+
+   ```bash
+   # Claude Code
+   export ANTHROPIC_CUSTOM_HEADERS="X-LLM-Router-User: alice"
+   ```
+
+   ```jsonc
+   // opencode: in the provider's "options"
+   "options": { "baseURL": "http://router:8080/v1", "headers": { "X-LLM-Router-User": "alice" } }
+   ```
+
+3. **Otherwise, by the address they connect from.** That already tells apart people on their own
+   machines. Behind a reverse proxy, every client would show up as the proxy, unless its address is
+   in `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), in which case the router uses the
+   `X-Forwarded-For` it sends.
+
+A user name is whatever the client says it is. This is for seeing what is going on, not for access
+control.
+
+Sessions are Claude Code's own session id (its subagents are grouped under the session that
+started them), Open WebUI's chat id, or an `x-session-id` header. Failing all of those, a session is
+inferred from the start of the conversation, the same way affinity does it. That means a
+conversation whose opening is edited, or compacted away, shows up as a new session. **Nothing from a
+prompt is stored**: an inferred session is known by a hash.
+
+### Settings
+
+All optional, and all reloadable:
+
+```yaml
+tracking:
+  enabled: true          # false stops recording and forgets what was recorded
+  slow_after_s: 15       # silence before a request is flagged slow...
+  stuck_after_s: 60      # ...and stuck
+  retain_s: 3600         # how long an idle session stays listed
+  max_sessions: 2000     # most sessions remembered; the longest idle go first
+  # Headers naming the user, first match wins. Replace the list to use your own.
+  # user_headers: [x-openwebui-user-email, x-openwebui-user-id, x-openwebui-user-name,
+  #                x-llm-router-user, x-user]
+```
+
+`GET /sessions` is the same data as JSON, and `GET /sessions/<n>` one session in detail.
+
+### What it costs the router
+
+Next to nothing, by design, and measured:
+
+- **Per request, about 3 µs** from arrival to finish, plus about 70 ns per streamed chunk. It
+  writes a few fields as a request changes state. Nothing is hashed that affinity has not already
+  hashed, and nothing is sorted, aggregated or serialised on the request path.
+- **The queue's contention clock is event-driven**, not sampled: it advances when a request joins
+  or leaves the queue, or a backend fills or frees up, and each advance is one pass over the
+  backends. Nothing scans the queue, and nothing runs when the queue is empty.
+- **Watching costs well under 1% of one core.** The page polls every 2 seconds, and only while its
+  tab is visible. The JSON is built at most once a second however many people are watching (every
+  viewer in between gets the same bytes). Even at its full 2,000 sessions it takes about 2 ms to
+  build. Measured against an idle router, one open dashboard added 0.3% of a core, five added
+  0.4%, and 25 polling ten times faster than the page does added 3.4%.
+- **With traffic, router CPU per request stayed the same**, about 1.2 ms per streamed request,
+  whether tracking was off, on, or on with 25 dashboards attached.
+- **Memory is bounded** by `max_sessions`, and header values are truncated, so a client inventing
+  a new session id on every request cannot make it grow.
+- **Dashboard polling stays out of the access log**, so an open dashboard doesn't add a journal
+  line every couple of seconds.
+
+### Who can see it
+
+The dashboard shows user names and emails to anyone who can reach the router's port, as `/stats`
+and the API itself are already open to them. The router has no authentication. If that matters,
+listen on a private interface, put `/dashboard` and `/sessions` behind a proxy that authenticates,
+or set `tracking.enabled: false`. The page itself loads nothing from outside the router, so it
+works on an isolated network. It renders every client-supplied value as text, under a strict
+content security policy.
+
 ## How routing decides
 
 For each request: derive the session key → look up the pinned backend → then
@@ -404,6 +674,18 @@ placed are placed. That is what keeps one session's affinity wait from stalling 
 
 On connection errors and 429/502/503/504, the request fails over to a different backend — but only
 before the first byte has reached the client, so a stream is never silently restarted.
+
+**A client that hangs up takes its request with it**, whatever stage it has reached. Queued, it
+leaves the queue, and never takes a slot. Waiting on a backend, the upstream request is closed.
+That's how a backend learns to stop generating, and the slot is freed for the next request.
+Mid-stream, the same thing happens. This matters most for agents: pressing Esc in Claude Code, or
+stopping a reply in Open WebUI, would otherwise leave the old request running for nobody, holding
+a slot the next turn needs. These count as `abandoned` in `/stats`, and show as `cancelled` in the
+web dashboard, with the stage the client left at.
+
+This assumes a backend stops when its connection closes. vLLM does, and so do recent llama.cpp
+builds. One that keeps generating anyway stays busier than the router thinks until it finishes.
+The router already makes the same assumption when a client leaves mid-stream.
 
 ## See it work without a GPU
 

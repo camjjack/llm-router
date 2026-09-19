@@ -14,6 +14,7 @@ import json
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 # Boundaries shallower than this are not used for pinning. For OpenAI bodies,
@@ -106,11 +107,36 @@ DEFAULT_SESSION_HEADERS = (
 )
 
 
-def explicit_session_id(
+CLAUDE_CODE = "claude-code"
+BODY = "body"
+
+
+@dataclass(frozen=True, slots=True)
+class ExplicitSession:
+    """A conversation id the client supplied, and where it came from."""
+
+    # CLAUDE_CODE, BODY, or the name of the header that carried it.
+    source: str
+    id: str
+    # Claude Code's subagent, if this request came from one.
+    agent: str | None = None
+
+    @property
+    def key(self) -> str:
+        """The pin key: namespaced by source, so ids from different places never collide."""
+        if self.source == CLAUDE_CODE:
+            suffix = f"/{self.agent}" if self.agent else ""
+            return f"explicit:cc:{self.id}{suffix}"
+        if self.source == BODY:
+            return f"explicit:{self.id}"
+        return f"explicit:{self.source}:{self.id}"
+
+
+def explicit_session(
     body: dict[str, Any],
     headers: Any,
     session_headers: Sequence[str] = DEFAULT_SESSION_HEADERS,
-) -> str | None:
+) -> ExplicitSession | None:
     """An exact conversation id, when the client supplies one.
 
     Claude Code sends `x-claude-code-session-id` on every request, which beats
@@ -125,18 +151,27 @@ def explicit_session_id(
         claude_session = headers.get("x-claude-code-session-id")
         if claude_session:
             agent = headers.get("x-claude-code-agent-id")
-            suffix = f"/{agent}" if agent else ""
-            return f"explicit:cc:{claude_session}{suffix}"
+            return ExplicitSession(CLAUDE_CODE, claude_session, agent or None)
 
         for name in session_headers:
             value = headers.get(name)
             if value:
-                return f"explicit:{name}:{value}"
+                return ExplicitSession(name, value)
 
     value = body.get("session_id")
     if value and isinstance(value, str):
-        return f"explicit:{value}"
+        return ExplicitSession(BODY, value)
     return None
+
+
+def explicit_session_id(
+    body: dict[str, Any],
+    headers: Any,
+    session_headers: Sequence[str] = DEFAULT_SESSION_HEADERS,
+) -> str | None:
+    """The pin key for the client's own conversation id, if it sent one."""
+    session = explicit_session(body, headers, session_headers)
+    return session.key if session is not None else None
 
 
 class SessionMap:

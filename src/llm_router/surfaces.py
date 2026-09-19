@@ -118,11 +118,14 @@ class OpenAISurface(Surface):
         # means unknown rather than none: see TokenUsage.
         details = usage.get("prompt_tokens_details")
         cached = _int_or_none(details.get("cached_tokens")) if isinstance(details, dict) else None
+        output = usage.get("completion_tokens_details")
+        reasoning = _int_or_none(output.get("reasoning_tokens")) if isinstance(output, dict) else None
         # OpenAI's prompt_tokens already includes the cached portion.
         return TokenUsage(
             prompt_tokens=prompt,
             completion_tokens=_int(usage.get("completion_tokens")),
             cached_tokens=cached,
+            reasoning_tokens=reasoning,
         )
 
 

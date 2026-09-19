@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -15,8 +16,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import surfaces
-from .affinity import SessionMap, explicit_session_id
+from . import clients, dashboard, surfaces
+from .affinity import ExplicitSession, SessionMap, explicit_session
 from .backend import BackendClients
 from .config import Config
 from .scheduler import (
@@ -29,6 +30,7 @@ from .scheduler import (
 )
 from .stats import RouterStats
 from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface
+from .tracking import CANCELLED, ERROR, OK, SessionTracker, Tracked
 
 log = logging.getLogger("llm_router.proxy")
 
@@ -66,6 +68,20 @@ HOP_BY_HOP = {
 FORWARDED_HEADER_PREFIXES = ("anthropic-",)
 
 
+async def _until_client_leaves(receive) -> None:
+    """Return once the client has hung up.
+
+    Only for after the request body has been read: from then on, the one thing
+    receive() can still deliver is word that the client has gone.
+    """
+    try:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+    except Exception:  # noqa: BLE001 -- never let a failure to watch look like a hang-up
+        # Can't tell. Carry on as though the client were still there.
+        await asyncio.Event().wait()
+
+
 class Router:
     def __init__(self, config: Config):
         self.config = config
@@ -79,6 +95,7 @@ class Router:
         )
         for backend in config.backends:
             self.stats.backend(backend.name)
+        self.tracker = SessionTracker(config.tracking)
         self.scheduler.on_drained = self._on_drained
         # Models we have already complained about having mismatched contexts.
         self._context_warned: set[str] = set()
@@ -125,6 +142,7 @@ class Router:
             routing.session_ttl_s, routing.max_sessions, routing.affinity_depth
         )
         dropped = self.sessions.forget_backends({*diff.removed, *diff.replaced})
+        self.tracker.reconfigure(new.tracking)
 
         # A replaced backend is a different machine under the same name; its
         # predecessor's latency and cache figures say nothing about it. Likewise a
@@ -177,7 +195,9 @@ class Router:
                     for c in changed
                 ]
             parts.append(f"updated {name} ({', '.join(changed)})")
-        for section in ("model_aliases", "routing", "health", "timeouts"):
+        for section in (
+            "model_aliases", "routing", "health", "timeouts", "tracking", "models", "clients"
+        ):
             if getattr(old, section) != getattr(new, section):
                 parts.append(f"{section} changed")
         if dropped_pins:
@@ -267,8 +287,78 @@ class Router:
         # Read once: a reload may swap self.config while this request waits, and
         # one request should not mix settings from two generations.
         config = self.config
+        explicit = explicit_session(body, request.headers, config.routing.session_headers)
+        keys = [explicit.key] if explicit else surface.session_keys(body)
+
+        client = request.client
+        tracked = self.tracker.begin(
+            request.headers.raw,
+            client.host if client else None,
+            body,
+            requested,
+            explicit,
+            keys,
+        )
+        # Once the body is in, the client can tell us only one more thing: that
+        # it has hung up. If it does before its response is ready, this handler
+        # is cancelled -- see the except clause.
+        handler = asyncio.current_task()
+        finished = abandoned = False
+
+        def client_left(watch: asyncio.Future) -> None:
+            nonlocal abandoned
+            # `finished` is set in the same step as the response is produced, so
+            # a hang-up noticed after that can never cancel a response on its
+            # way out.
+            if not finished and not watch.cancelled():
+                abandoned = True
+                handler.cancel()
+
+        watching = asyncio.ensure_future(_until_client_leaves(request.receive))
+        watching.add_done_callback(client_left)
+        response: Response | None = None
+        try:
+            response = await self._route(
+                request, surface, body, requested, config, explicit, keys, tracked
+            )
+            return response
+        except asyncio.CancelledError:
+            # Ours, from client_left -- unless something else cancelled this
+            # handler as well (the server shutting down), which then wins.
+            if not abandoned or handler.uncancel() > 0:
+                raise
+            # Left queued, it would have gone on to take a slot; left waiting on
+            # a backend, kept that backend generating -- both for nobody. The
+            # cancellation has dropped it from the queue, or closed the upstream
+            # request, which is how a backend learns to stop.
+            tracked.note = f"client left while {tracked.state}"
+            self.stats.abandoned += 1
+            log.debug("client hung up; abandoned its request (%s)", tracked.state)
+            # Nobody will read this. 499 is nginx's "client closed request".
+            return Response(status_code=499)
+        finally:
+            finished = True
+            watching.cancel()
+            # A stream records its own end, once its last byte has gone out.
+            if not tracked.stream_owned:
+                self.tracker.finish(
+                    tracked, response.status_code if response is not None else None
+                )
+
+    async def _route(
+        self,
+        request: Request,
+        surface: Surface,
+        body: dict,
+        requested: str,
+        config: Config,
+        explicit: ExplicitSession | None,
+        keys: list[str],
+        tracked: Tracked,
+    ) -> Response:
         model = self.resolve_model(requested)
         if not config.backends_for(model):
+            tracked.note = "unknown model"
             return surface.error(
                 404,
                 f"model '{requested}' is not served by any configured backend "
@@ -280,10 +370,6 @@ class Router:
         streaming = bool(body.get("stream"))
         routing = config.routing
 
-        explicit = explicit_session_id(
-            body, request.headers, routing.session_headers
-        )
-        keys = [explicit] if explicit else surface.session_keys(body)
         min_depth = 1 if explicit else surface.min_affinity_depth
         if surface is OPENAI:
             # `session_id` is ours, not part of the OpenAI schema; never forward it.
@@ -318,6 +404,7 @@ class Router:
         reroutes = MAX_RELOAD_REROUTES
 
         while failures <= routing.max_retries:
+            tracked.queued(preferred, routing.affinity_wait_ms / 1000.0)
             try:
                 lease = await self.scheduler.acquire(
                     model,
@@ -339,6 +426,7 @@ class Router:
                 if last_error is not None:
                     return last_error
                 self.stats.rejected_no_backend += 1
+                tracked.note = "no healthy backend"
                 return surface.error(
                     503,
                     f"no healthy backend available for model '{model}'",
@@ -346,6 +434,7 @@ class Router:
                 )
             except QueueTimeout:
                 self.stats.queue_timeouts += 1
+                tracked.note = "queue timeout"
                 return surface.error(
                     503,
                     f"timed out waiting {routing.queue_timeout_s:.0f}s for a free slot",
@@ -366,9 +455,16 @@ class Router:
             self._record_lease(lease, pinned=preferred is not None)
             if failures:
                 self.stats.retries += 1
+            tracked.dispatched(
+                lease.name,
+                lease.queue_wait_s,
+                # Its share of the time this backend spends full with a queue
+                # behind it: what holding this slot costs everyone else.
+                lambda state=lease.backend: self.scheduler.contended_seconds(state),
+            )
 
             outcome, response = await self._dispatch(
-                lease, body, streaming, keys, surface, request, min_depth, model
+                lease, body, streaming, keys, surface, request, min_depth, model, tracked
             )
             if outcome == "ok":
                 return response
@@ -493,6 +589,7 @@ class Router:
         request: Request,
         min_depth: int,
         model: str,
+        tracked: Tracked,
     ) -> tuple[str, Response]:
         backend = lease.backend.config
         # Borrowed for exactly as long as the slot is held, so a reload that
@@ -517,11 +614,11 @@ class Router:
             if streaming:
                 return await self._dispatch_streaming(
                     lease, client, headers, payload, keys, started, surface,
-                    params, min_depth,
+                    params, min_depth, tracked,
                 )
             return await self._dispatch_buffered(
                 lease, client, headers, payload, keys, started, surface,
-                params, min_depth,
+                params, min_depth, tracked,
             )
         except (httpx.HTTPError, OSError) as exc:
             lease.release()
@@ -536,6 +633,12 @@ class Router:
                     surfaces.UNREACHABLE,
                 ),
             )
+        except BaseException:
+            # Cancelled because the client hung up (see _handle), or something
+            # unexpected. Either way the slot goes back; releasing is idempotent,
+            # so a path that already released it is unaffected.
+            lease.release()
+            raise
 
     async def _dispatch_buffered(
         self,
@@ -548,6 +651,7 @@ class Router:
         surface: Surface,
         params: dict,
         min_depth: int,
+        tracked: Tracked,
     ) -> tuple[str, Response]:
         name = lease.name
         upstream = await client.post(
@@ -578,6 +682,7 @@ class Router:
         except ValueError:
             data = None
         usage = surface.usage_from_body(data)
+        tracked.usage = usage
         if usage is not None:
             bstats.record_usage(usage)
             if usage.completion_tokens > 0 and elapsed > 0:
@@ -604,6 +709,7 @@ class Router:
         surface: Surface,
         params: dict,
         min_depth: int,
+        tracked: Tracked,
     ) -> tuple[str, Response]:
         name = lease.name
         request = client.build_request(
@@ -628,8 +734,10 @@ class Router:
         if keys:
             self.sessions.assign(keys, name, min_depth)
 
+        # From here the stream, not the handler, says when this request is done.
+        tracked.stream_owned = True
         return ("ok", StreamingResponse(
-            self._stream_body(lease, upstream, started, surface),
+            self._stream_body(lease, upstream, started, surface, tracked),
             status_code=200,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
             headers={
@@ -640,13 +748,19 @@ class Router:
         ))
 
     async def _stream_body(
-        self, lease: Lease, upstream: httpx.Response, started: float, surface: Surface
+        self,
+        lease: Lease,
+        upstream: httpx.Response,
+        started: float,
+        surface: Surface,
+        tracked: Tracked,
     ):
         name = lease.name
         bstats = self.stats.backend(name)
         tap = StreamTap(surface)
         first_byte_at: float | None = None
         failed = False
+        finished = False
 
         try:
             # aiter_raw forwards bytes exactly as they arrive, including SSE ping
@@ -656,8 +770,10 @@ class Router:
                 if first_byte_at is None:
                     first_byte_at = time.monotonic()
                     bstats.ttft_s.append(first_byte_at - started)
+                tracked.received(len(chunk))
                 tap.feed(chunk)
                 yield chunk
+            finished = True
         except (httpx.HTTPError, OSError) as exc:
             # Mid-stream failure: the client has bytes already, so we cannot retry.
             failed = True
@@ -681,6 +797,11 @@ class Router:
                     decode_s = time.monotonic() - first_byte_at
                     if decode_s > 0:
                         bstats.tokens_per_s.append(usage.completion_tokens / decode_s)
+            tracked.usage = usage
+            # Neither failed nor finished: the client hung up mid-stream.
+            self.tracker.finish(
+                tracked, 200, ERROR if failed else OK if finished else CANCELLED
+            )
 
     def _upstream_error(
         self, state: BackendState, status: int, content: bytes, surface: Surface
@@ -762,15 +883,20 @@ class Router:
         now = int(time.time())
         data = []
         for model in self.config.all_models:
+            meta = self.config.models.get(model)
             entry: dict[str, Any] = {
                 "id": model,
                 "object": "model",
                 "created": now,
                 "owned_by": "llm-router",
                 # Claude Code's gateway model discovery reads id and display_name.
-                "display_name": model,
+                "display_name": (meta.name if meta and meta.name else model),
             }
-            context = self.context_for(model)
+            # What clients should assume: the discovered window, or less if the
+            # config says so -- the same figure the generated client configs use.
+            context, _ = clients.model_context(
+                meta.context_length if meta else None, self.context_for(model)
+            )
             if context is not None:
                 # Three spellings of the same number, because clients disagree:
                 # `max_model_len` is the vLLM/ninfer convention, `meta.n_ctx` the
@@ -853,6 +979,55 @@ class Router:
             },
         }
 
+    def tracking_snapshot(self) -> dict:
+        """What /sessions serves: the tracker's view, plus just enough about the
+        backends and queue to explain why something is waiting."""
+        sched = self.scheduler
+        now = time.monotonic()
+        backends = [
+            {
+                "name": name,
+                "inflight": state.inflight,
+                "capacity": state.capacity,
+                "healthy": state.healthy,
+                "cooling_down": state.cooldown_until > now,
+                "draining": False,
+                "waiting": sched.waiting_for(state),
+                "contended_s": round(sched.contended_seconds(state), 2),
+            }
+            for name, state in sched.backends.items()
+        ]
+        backends.extend(
+            {
+                "name": state.name,
+                "inflight": state.inflight,
+                "capacity": state.capacity,
+                "healthy": state.healthy,
+                "cooling_down": False,
+                "draining": True,
+            }
+            for state in sched.draining
+        )
+        data = self.tracker.snapshot()
+        for view in data["in_flight"]:
+            # How many requests are queued behind this one, on a backend that
+            # has no free slot for them.
+            state = sched.backends.get(view["backend"]) if view["backend"] else None
+            view["blocking"] = (
+                sched.waiting_for(state) if state is not None and state.free == 0 else 0
+            )
+        return data | {
+            "router": {
+                "now": time.time(),
+                "uptime_s": now - self.stats.started_at,
+                "queue_depth": sched.queue_depth,
+                "waiting_on_affinity": sched.waiting_on_affinity,
+                "config_generation": self.config_generation,
+                "config_error": self.config_error,
+            },
+            "backends": backends,
+        }
+
 
 def create_app(
     config: Config, router: Router | None = None, reloader: Any = None
@@ -884,6 +1059,8 @@ def create_app(
             Route("/api/hello", router.hello, methods=["GET", "HEAD"]),
             Route("/health", router.health, methods=["GET"]),
             Route("/stats", router.stats_endpoint, methods=["GET"]),
+            *dashboard.routes(router),
+            *clients.routes(router),
         ],
         lifespan=lifespan,
     )

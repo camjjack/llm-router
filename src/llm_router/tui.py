@@ -167,6 +167,8 @@ def render(snapshot: dict[str, Any]) -> Group:
             (str(router.get("queue_timeouts", 0)), "red" if router.get("queue_timeouts") else "dim"),
             ("  retries ", "dim"),
             (str(router.get("retries", 0)), "dim"),
+            ("  abandoned ", "dim"),
+            (str(router.get("abandoned", 0)), "dim"),
         ),
     )
 
