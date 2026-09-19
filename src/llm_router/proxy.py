@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import dashboard, surfaces
+from . import clients, dashboard, surfaces
 from .affinity import ExplicitSession, SessionMap, explicit_session
 from .backend import BackendClients
 from .config import Config
@@ -195,7 +195,9 @@ class Router:
                     for c in changed
                 ]
             parts.append(f"updated {name} ({', '.join(changed)})")
-        for section in ("model_aliases", "routing", "health", "timeouts", "tracking"):
+        for section in (
+            "model_aliases", "routing", "health", "timeouts", "tracking", "models", "clients"
+        ):
             if getattr(old, section) != getattr(new, section):
                 parts.append(f"{section} changed")
         if dropped_pins:
@@ -875,15 +877,20 @@ class Router:
         now = int(time.time())
         data = []
         for model in self.config.all_models:
+            meta = self.config.models.get(model)
             entry: dict[str, Any] = {
                 "id": model,
                 "object": "model",
                 "created": now,
                 "owned_by": "llm-router",
                 # Claude Code's gateway model discovery reads id and display_name.
-                "display_name": model,
+                "display_name": (meta.name if meta and meta.name else model),
             }
-            context = self.context_for(model)
+            # What clients should assume: the discovered window, or less if the
+            # config says so -- the same figure the generated client configs use.
+            context, _ = clients.model_context(
+                meta.context_length if meta else None, self.context_for(model)
+            )
             if context is not None:
                 # Three spellings of the same number, because clients disagree:
                 # `max_model_len` is the vLLM/ninfer convention, `meta.n_ctx` the
@@ -1037,6 +1044,7 @@ def create_app(
             Route("/health", router.health, methods=["GET"]),
             Route("/stats", router.stats_endpoint, methods=["GET"]),
             *dashboard.routes(router),
+            *clients.routes(router),
         ],
         lifespan=lifespan,
     )

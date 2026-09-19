@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-router · connect</title>
+<link rel="stylesheet" href="dashboard/app.css">
+<script src="dashboard/connect.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="name">llm-router</span><span class="page">connect</span></div>
+  <nav class="nav"><a href="dashboard">Sessions dashboard</a></nav>
+</header>
+
+<main>
+  <section class="panel intro" aria-labelledby="intro-h">
+    <div class="panel-head">
+      <h2 id="intro-h">Connect a coding agent</h2>
+    </div>
+    <p class="lede">These configs are generated from the router's own settings: its models, the
+      context each takes, and how long a request may wait. Fetch them again after the router's
+      config changes, or use opencode's login, which keeps itself current.</p>
+    <div class="controls">
+      <label class="field">
+        <span>Your name</span>
+        <input type="text" id="user" maxlength="64" autocomplete="name" placeholder="optional"
+               aria-describedby="user-hint">
+        <small id="user-hint">Shows you by name in the sessions dashboard.</small>
+      </label>
+      <label class="field">
+        <span>Start on</span>
+        <select id="model"></select>
+        <small id="base"></small>
+      </label>
+    </div>
+  </section>
+
+  <div id="warnings" class="banner" role="alert" hidden></div>
+
+  <section class="panel" aria-labelledby="client-h">
+    <h2 id="client-h" class="sr">Client</h2>
+    <div class="tabs" role="tablist" id="tabs" aria-label="Coding agent"></div>
+    <div id="client" class="client" role="tabpanel"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="models-h">
+    <div class="panel-head">
+      <h2 id="models-h">Models</h2>
+      <p class="hint">Context is discovered from the backends unless the router's config sets
+        it lower. Request params are sent by clients that can add fields to a request.</p>
+    </div>
+    <div class="scroll">
+      <table id="models">
+        <thead><tr>
+          <th scope="col">Model</th><th scope="col">Name</th>
+          <th scope="col" class="num">Context</th><th scope="col" class="num">Max output</th>
+          <th scope="col">Tools</th><th scope="col">Reasoning</th><th scope="col">Images</th>
+          <th scope="col">Request params</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="legend">
+    <p>Raw configs: <span id="raw"></span></p>
+  </footer>
+</main>
+</body>
+</html>

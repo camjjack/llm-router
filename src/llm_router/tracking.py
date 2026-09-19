@@ -75,6 +75,8 @@ MAX_AGENTS_PER_SESSION = 64
 KNOWN_CLIENTS = (
     ("claude-cli", "Claude Code"),
     ("opencode", "opencode"),
+    ("qwencode", "Qwen Code"),
+    ("qwen-code", "Qwen Code"),
     ("aider", "aider"),
     ("cline", "Cline"),
     ("zed", "Zed"),

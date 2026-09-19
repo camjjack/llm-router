@@ -19,6 +19,7 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 | `POST /v1/messages/count_tokens` | Claude Code token accounting |
 | `GET /v1/models`, `GET /health`, `GET /stats` | discovery, liveness, telemetry |
 | `GET /dashboard`, `GET /sessions` | who is using it, and what is stuck — see [the web dashboard](#sessions-and-users-the-web-dashboard) |
+| `GET /connect`, `GET /clients/<name>` | ready-made configs for opencode, Claude Code, Qwen Code and Zed — see [connecting coding agents](#connecting-coding-agents) |
 
 | `kind` | Liveness | Load telemetry | Context from | Capacity should match |
 |---|---|---|---|---|
@@ -266,22 +267,110 @@ Override per backend with `context_length:` when a host lies or publishes nothin
 ### opencode needs telling separately
 
 opencode pulls context limits from models.dev for known providers and from your own config for
-custom ones — it does **not** read them from `/v1/models`. So set them explicitly, matching what
-`curl http://127.0.0.1:8080/v1/models` reports:
+custom ones — it does **not** read them from `/v1/models`. The config the router generates for it
+carries them, so this is taken care of; see [connecting coding agents](#connecting-coding-agents).
 
-```json
-{
-  "provider": {
-    "local": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
-      "models": {
-        "qwen3.6-27b": { "limit": { "context": 32768, "output": 8192 } }
-      }
-    }
-  }
-}
+To tell clients a smaller window than the backends serve (a long session is quicker, and many
+models do worse near the end of their window), set it per model:
+
+```yaml
+models:
+  qwen3.6-27b:
+    context_length: 32768     # never more than the backends serve: that is capped, with a warning
 ```
+
+`/v1/models` and every generated client config then advertise 32768.
+
+## Connecting coding agents
+
+Open `http://<router>:8080/connect`. It has a ready-made config for **opencode**, **Claude Code**,
+**Qwen Code** and **Zed**, with where it goes and how to install it, generated from the router's own
+config. Each client is told the model ids, the context and output each model takes, the request
+fields a model wants, and timeouts long enough for the router's queue. Type your name in and each
+config also carries the header the [session dashboard](#sessions-and-users-the-web-dashboard) shows
+you by.
+
+The same configs are plain files, for scripts:
+
+```bash
+curl -s http://router:8080/clients/opencode          # also claude-code, qwen-code, zed
+curl -s 'http://router:8080/clients/claude-code?user=alice&model=glm-air'
+curl -s 'http://router:8080/clients/claude-code?format=shell'   # export lines instead of JSON
+curl -s http://router:8080/clients                   # all of them, with install steps, as JSON
+```
+
+**opencode can keep itself up to date.** Log in to the router once:
+
+```bash
+opencode auth login http://router:8080          # or http://router:8080/u/alice, to be named
+```
+
+and opencode fetches its config from the router's `/.well-known/opencode` every time it starts,
+layered underneath your own settings. Change a model in the router's config and every opencode
+logged in to it follows. The other clients need their config fetched again.
+
+### Describing the models
+
+Everything is optional. Without it, clients still get every model with its discovered context.
+
+```yaml
+models:
+  GLM-5.3-Flash-EXL3:
+    name: GLM-5.3 Flash EXL3          # what clients display
+    tool_call: true                   # default true
+    reasoning: true                   # default false
+    images: false                     # default false
+    context_length: 200000            # tell clients less than the backends serve
+    max_output_tokens: 32768
+    reasoning_efforts: [low, high, max]   # levels to switch between, where a client can
+    request_params:                   # extra request-body fields clients should send
+      reasoning_effort: high          # the default effort
+      chat_template_kwargs: {clear_thinking: true}
+
+clients:
+  provider_id: glm53                  # default llm-router
+  provider_name: GLM-5.3 Flash EXL3 (Sparks)
+  default_model: GLM-5.3-Flash-EXL3   # default: the first model in the config
+  small_model: GLM-5.3-Flash-EXL3     # titles, summaries, commit messages; unset = client default
+  # base_url: http://10.0.0.1:8888    # default: the address the config was fetched from
+  # api_key: unused                   # the router ignores it, but clients insist on one
+```
+
+`base_url` needs setting only if people reach the router at a different address than the one the
+config is fetched from. That happens when it's fetched as `localhost` on the router's own host, or
+from behind a proxy.
+
+### Where the numbers come from
+
+- **Context** is what the backends report, capped by `context_length`. An unknown window is left
+  out, with a warning on the connect page, rather than guessed.
+- **How long to wait for a response to start** is `queue_timeout_s + first_byte_s`: the longest a
+  request can sit in the router's queue, plus the longest it waits for its backend. With the
+  defaults that's 900s, more than several clients wait by themselves: opencode gives up after
+  300s, and Claude Code after 600s.
+- **How long a response may go quiet** is `first_byte_s`. With vLLM and llama.cpp a response's
+  headers arrive at once and prefill happens before its first chunk, so a long prefill counts
+  against this. opencode's own limit is 300s, and Claude Code's stream watchdog fires after two
+  minutes.
+
+### What each client gets
+
+These were checked by running each client against the router and looking at what arrived, which
+turned up more than the documentation did:
+
+- **opencode** ignores `reasoning_effort` in a model's `options`, silently. Effort is a *variant*,
+  so each effort level becomes one, the configured effort becomes the default, and `--variant max`
+  (or the variant key in the TUI) switches. opencode uses the lowest variant for titles. Other
+  `request_params` go in `options` and are sent. It asks for at most 32,000 output tokens, whatever
+  the limit says.
+- **Claude Code** gets its `opus`, `sonnet` and `fable` aliases mapped to `default_model`, and
+  `haiku`, its background model, to `small_model`. One further model fits in the `/model` picker.
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells it when to compact. It can't send `request_params`, and it
+  needs backends that speak the Anthropic Messages API.
+- **Qwen Code** sends `request_params` with every request, as `extra_body`.
+- **Zed** sends `reasoning_effort` but no other `request_params`. It keeps API keys out of
+  `settings.json`, so it reads `<PROVIDER_ID>_API_KEY` (for example `GLM53_API_KEY`) from the
+  environment.
 
 ## Claude Code
 
@@ -456,11 +545,6 @@ their sessions is doing right now, and anything that has stopped getting answers
 | `processing` | Sent to a backend, nothing back yet: prefill, or the whole of a reply that isn't streamed. |
 | `streaming` | Tokens are arriving. |
 | `idle` (sessions only) | Nothing in flight. The session is waiting on its client, not on the router. |
-
-**Slow and stuck are measured on silence:** the time since the last byte came back, or since the
-request arrived if none has. A long reply that is still producing tokens is never stuck. A request
-queued for a minute, a prefill that hasn't produced a first token, or a stream that stopped
-mid-reply, is. Slow is 15s and stuck 60s by default, and stuck requests sort to the top.
 
 ### How users are identified
 

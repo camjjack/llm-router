@@ -1,4 +1,4 @@
-"""The web dashboard: one static page, and the JSON it polls.
+"""The web pages -- the session dashboard and the connect page -- and the JSON they poll.
 
 The page is plain HTML, CSS and JavaScript shipped inside the package, so it has
 no build step and loads nothing from the internet -- it works on an isolated
@@ -34,9 +34,13 @@ SNAPSHOT_TTL_S = 1.0
 # Served from memory once read: name -> media type.
 ASSETS = {
     "index.html": "text/html; charset=utf-8",
+    "connect.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "connect.js": "text/javascript; charset=utf-8",
     "app.css": "text/css; charset=utf-8",
 }
+# Served at their own paths rather than as assets.
+PAGES = {"index.html", "connect.html"}
 
 # Everything the page shows comes from client-supplied headers (user names, session
 # ids), so it is rendered as text, never markup. This is the backstop if that ever
@@ -106,9 +110,12 @@ def routes(router: Router) -> list[Route]:
     async def page(request: Request) -> Response:
         return static("index.html")
 
+    async def connect(request: Request) -> Response:
+        return static("connect.html")
+
     async def asset(request: Request) -> Response:
         name = request.path_params["name"]
-        if name not in ASSETS or name == "index.html":
+        if name not in ASSETS or name in PAGES:
             return Response(status_code=404)
         return static(name)
 
@@ -128,6 +135,7 @@ def routes(router: Router) -> list[Route]:
 
     return [
         Route("/dashboard", page, methods=["GET"]),
+        Route("/connect", connect, methods=["GET"]),
         Route("/dashboard/{name}", asset, methods=["GET"]),
         Route("/sessions", sessions, methods=["GET"]),
         Route("/sessions/{n:int}", session_detail, methods=["GET"]),
