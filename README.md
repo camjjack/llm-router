@@ -18,6 +18,7 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 | `POST /v1/messages` | Claude Code (also `?beta=true`) |
 | `POST /v1/messages/count_tokens` | Claude Code token accounting |
 | `GET /v1/models`, `GET /health`, `GET /stats` | discovery, liveness, telemetry |
+| `GET /dashboard`, `GET /sessions` | who is using it, and what is stuck — see [the web dashboard](#sessions-and-users-the-web-dashboard) |
 
 | `kind` | Liveness | Load telemetry | Context from | Capacity should match |
 |---|---|---|---|---|
@@ -361,6 +362,10 @@ inference in one specific way: it survives a user **editing or regenerating** an
 where the prompt prefix legitimately changes but the conversation has not, so the chat stays on the
 host that still holds most of its KV.
 
+The same setting sends the user's name and email, which the
+[web dashboard](#sessions-and-users-the-web-dashboard) uses to show each person's chats and whether
+any of them are stuck.
+
 Check it is working in the dashboard's `identity` row, or:
 
 ```bash
@@ -369,7 +374,8 @@ curl -s localhost:8080/stats | jq '.router | {keys_from_header, keys_from_prefix
 
 ### Why chat id and not user id
 
-Open WebUI also forwards `X-OpenWebUI-User-Id`, and the router **deliberately ignores it**. Pinning
+Open WebUI also forwards `X-OpenWebUI-User-Id`, and routing **deliberately ignores it** (the web
+dashboard reads it, but only to label things). Pinning
 per user would pile all of one person's chats onto a single host: worse for balance, and no better
 for cache reuse than pinning each chat separately. Identity is not the unit of KV locality — a
 conversation is. There is a test asserting the user headers never form a pin.
@@ -429,6 +435,110 @@ is finishing its last requests.
 If `cache` sits near zero on a long agentic session, affinity isn't sticking: check whether the
 client is rewriting earlier messages (context compaction legitimately breaks the prefix), and whether
 `affinity_wait_ms` is long enough for your pool.
+
+## Sessions and users: the web dashboard
+
+Open `http://127.0.0.1:8080/dashboard` in a browser. It shows who is using the router, what each of
+their sessions is doing right now, and anything that has stopped getting answers:
+
+- **In flight**: every request the router is holding, in its current state, with how long the
+  client has been waiting and how long it has been since anything came back.
+- **Users**: each person, their clients, sessions, errors and tokens. Select one to see only their
+  sessions.
+- **Sessions**: the conversations themselves. Expand one to see its last few requests: which
+  subagent sent each, where it ran, how long it queued, time to first token, and tokens used.
+- **Recent requests**: the last 50 to finish, which can be filtered to errors only.
+
+| State | Meaning |
+|---|---|
+| `queued` | Waiting for a free slot on any backend. |
+| `holding` | Waiting for the backend its session is pinned to, to reuse the prompt cache there. It spills elsewhere once `affinity_wait_ms` runs out. |
+| `processing` | Sent to a backend, nothing back yet: prefill, or the whole of a reply that isn't streamed. |
+| `streaming` | Tokens are arriving. |
+| `idle` (sessions only) | Nothing in flight. The session is waiting on its client, not on the router. |
+
+**Slow and stuck are measured on silence:** the time since the last byte came back, or since the
+request arrived if none has. A long reply that is still producing tokens is never stuck. A request
+queued for a minute, a prefill that hasn't produced a first token, or a stream that stopped
+mid-reply, is. Slow is 15s and stuck 60s by default, and stuck requests sort to the top.
+
+### How users are identified
+
+In this order:
+
+1. **Open WebUI**, started with `ENABLE_FORWARD_USER_INFO_HEADERS=true`, which sends each user's
+   email, id and name. With the same setting its chat id identifies each session exactly.
+2. **An `X-LLM-Router-User` header**, for coding agents on people's own machines:
+
+   ```bash
+   # Claude Code
+   export ANTHROPIC_CUSTOM_HEADERS="X-LLM-Router-User: alice"
+   ```
+
+   ```jsonc
+   // opencode: in the provider's "options"
+   "options": { "baseURL": "http://router:8080/v1", "headers": { "X-LLM-Router-User": "alice" } }
+   ```
+
+3. **Otherwise, by the address they connect from.** That already tells apart people on their own
+   machines. Behind a reverse proxy, every client would show up as the proxy, unless its address is
+   in `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), in which case the router uses the
+   `X-Forwarded-For` it sends.
+
+A user name is whatever the client says it is. This is for seeing what is going on, not for access
+control.
+
+Sessions are Claude Code's own session id (its subagents are grouped under the session that
+started them), Open WebUI's chat id, or an `x-session-id` header. Failing all of those, a session is
+inferred from the start of the conversation, the same way affinity does it. That means a
+conversation whose opening is edited, or compacted away, shows up as a new session. **Nothing from a
+prompt is stored**: an inferred session is known by a hash.
+
+### Settings
+
+All optional, and all reloadable:
+
+```yaml
+tracking:
+  enabled: true          # false stops recording and forgets what was recorded
+  slow_after_s: 15       # silence before a request is flagged slow...
+  stuck_after_s: 60      # ...and stuck
+  retain_s: 3600         # how long an idle session stays listed
+  max_sessions: 2000     # most sessions remembered; the longest idle go first
+  # Headers naming the user, first match wins. Replace the list to use your own.
+  # user_headers: [x-openwebui-user-email, x-openwebui-user-id, x-openwebui-user-name,
+  #                x-llm-router-user, x-user]
+```
+
+`GET /sessions` is the same data as JSON, and `GET /sessions/<n>` one session in detail.
+
+### What it costs the router
+
+Next to nothing, by design, and measured:
+
+- **Per request, about 3 µs** from arrival to finish, plus about 70 ns per streamed chunk. It
+  writes a few fields as a request changes state. Nothing is hashed that affinity has not already
+  hashed, and nothing is sorted, aggregated or serialised on the request path.
+- **Watching costs well under 1% of one core.** The page polls every 2 seconds, and only while its
+  tab is visible. The JSON is built at most once a second however many people are watching (every
+  viewer in between gets the same bytes). Even at its full 2,000 sessions it takes about 2 ms to
+  build. Measured against an idle router, one open dashboard added 0.3% of a core, five added
+  0.4%, and 25 polling ten times faster than the page does added 3.4%.
+- **With traffic, router CPU per request stayed the same**, about 1.2 ms per streamed request,
+  whether tracking was off, on, or on with 25 dashboards attached.
+- **Memory is bounded** by `max_sessions`, and header values are truncated, so a client inventing
+  a new session id on every request cannot make it grow.
+- **Dashboard polling stays out of the access log**, so an open dashboard doesn't add a journal
+  line every couple of seconds.
+
+### Who can see it
+
+The dashboard shows user names and emails to anyone who can reach the router's port, as `/stats`
+and the API itself are already open to them. The router has no authentication. If that matters,
+listen on a private interface, put `/dashboard` and `/sessions` behind a proxy that authenticates,
+or set `tracking.enabled: false`. The page itself loads nothing from outside the router, so it
+works on an isolated network. It renders every client-supplied value as text, under a strict
+content security policy.
 
 ## How routing decides
 

@@ -38,6 +38,19 @@ health:
   timeout_s: 3
   failure_threshold: 2
 
+# Per-user session tracking, shown at http://<router>/dashboard. Users are named
+# by Open WebUI's forwarded headers (ENABLE_FORWARD_USER_INFO_HEADERS=true) or an
+# X-LLM-Router-User header, and otherwise by address. All optional; the defaults
+# are shown.
+tracking:
+  enabled: true
+  # A request that has heard nothing back for this long is flagged slow, then stuck.
+  slow_after_s: 15
+  stuck_after_s: 60
+  # How long an idle session stays listed, and the most sessions remembered.
+  retain_s: 3600
+  max_sessions: 2000
+
 # Map requested model names onto configured ones. Claude Code sends whatever
 # ANTHROPIC_MODEL is set to, and *also* issues background requests for its
 # small/fast model (summarisation, commit messages). Without an entry for those,

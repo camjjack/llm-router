@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from .affinity import DEFAULT_SESSION_HEADERS
+from .tracking import DEFAULT_USER_HEADERS
 
 # Backend engines we know how to probe. They differ in where they publish context
 # length and load, and in whether they want to be saturated -- see BackendConfig.
@@ -129,6 +130,25 @@ class TimeoutConfig:
 
 
 @dataclass(frozen=True)
+class TrackingConfig:
+    """Per-user session tracking, shown at /dashboard."""
+
+    enabled: bool = True
+    # Request headers naming the user, tried in order. With none of them present
+    # a user is known by the address they connect from.
+    user_headers: tuple[str, ...] = DEFAULT_USER_HEADERS
+    # An in-flight request that has had nothing back for this long is flagged
+    # slow, and at stuck_after_s, stuck. "Nothing back" is time since its last
+    # response byte, or since it arrived if none has come yet.
+    slow_after_s: float = 15.0
+    stuck_after_s: float = 60.0
+    # How long an idle session stays listed.
+    retain_s: float = 3600.0
+    # Most sessions remembered; beyond it the longest-idle go first.
+    max_sessions: int = 2000
+
+
+@dataclass(frozen=True)
 class Config:
     backends: tuple[BackendConfig, ...]
     # Maps a requested model name onto a configured one. A "*" key is a catch-all
@@ -139,6 +159,7 @@ class Config:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
     host: str = "0.0.0.0"
     port: int = 8080
     log_file: str | None = None
@@ -183,14 +204,16 @@ def _section(raw: dict[str, Any], key: str, cls: type) -> Any:
             f"Valid keys: {', '.join(sorted(known))}"
         )
     data = dict(data)
-    if "session_headers" in data:
-        value = data["session_headers"]
+    for name in ("session_headers", "user_headers"):
+        if name not in data:
+            continue
+        value = data[name]
         if isinstance(value, str):
             value = [value]
         if not isinstance(value, list):
-            raise ConfigError("routing.session_headers must be a list of header names")
+            raise ConfigError(f"{key}.{name} must be a list of header names")
         # Header lookups are lowercase; normalise so config casing does not matter.
-        data["session_headers"] = tuple(str(v).lower() for v in value)
+        data[name] = tuple(str(v).lower() for v in value)
     return cls(**data)
 
 
@@ -256,6 +279,22 @@ def _parse_backend(raw: Any, index: int) -> BackendConfig:
     )
 
 
+def _parse_tracking(raw: dict[str, Any]) -> TrackingConfig:
+    tracking = _section(raw, "tracking", TrackingConfig)
+    if not isinstance(tracking.enabled, bool):
+        raise ConfigError("tracking.enabled must be true or false")
+    for name in ("slow_after_s", "stuck_after_s", "retain_s"):
+        value = getattr(tracking, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(f"tracking.{name} must be a positive number of seconds")
+    if tracking.slow_after_s > tracking.stuck_after_s:
+        raise ConfigError("tracking.slow_after_s must not exceed tracking.stuck_after_s")
+    limit = tracking.max_sessions
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ConfigError("tracking.max_sessions must be an integer >= 1")
+    return tracking
+
+
 def load_config(path: str | Path) -> Config:
     path = Path(path)
     if not path.exists():
@@ -312,6 +351,7 @@ def parse_config(text: str) -> Config:
         routing=_section(raw, "routing", RoutingConfig),
         health=_section(raw, "health", HealthConfig),
         timeouts=_section(raw, "timeouts", TimeoutConfig),
+        tracking=_parse_tracking(raw),
         host=str(listen.get("host", "0.0.0.0")),
         port=int(listen.get("port", 8080)),
         log_file=(str(raw["log_file"]) if raw.get("log_file") else None),

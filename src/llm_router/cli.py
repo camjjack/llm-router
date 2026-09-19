@@ -10,6 +10,7 @@ import sys
 import uvicorn
 
 from .config import ConfigError, load_config
+from .dashboard import QuietAccessLog
 from .proxy import Router, create_app
 from .reload import ConfigReloader
 
@@ -55,6 +56,8 @@ async def _serve(
             timeout_keep_alive=75,
         )
     )
+    # After uvicorn.Config, which sets up uvicorn's loggers.
+    logging.getLogger("uvicorn.access").addFilter(QuietAccessLog())
 
     if not tui:
         await server.serve()

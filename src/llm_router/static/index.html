@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-router · sessions</title>
+<link rel="stylesheet" href="dashboard/app.css">
+<script src="dashboard/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="name">llm-router</span><span class="page">sessions</span></div>
+  <div class="conn" role="status" aria-live="polite">
+    <span class="pulse" id="pulse"></span><span id="conn">connecting…</span>
+  </div>
+  <div class="meta" id="meta"></div>
+  <button id="pause" type="button" class="btn" aria-pressed="false">Pause</button>
+</header>
+
+<main>
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="panel" aria-labelledby="backends-h">
+    <div class="panel-head"><h2 id="backends-h">Backends</h2></div>
+    <div class="backends" id="backends"></div>
+  </section>
+
+  <div class="filter" id="filter" hidden>
+    <span>Showing only</span><strong id="filter-name"></strong>
+    <button type="button" class="btn small" id="filter-clear">Show everyone</button>
+  </div>
+
+  <section class="panel" aria-labelledby="inflight-h">
+    <div class="panel-head">
+      <h2 id="inflight-h">In flight</h2>
+      <p class="hint"><b>Waiting</b> is time since the client sent the request.
+        <b>Silent</b> is time since anything last came back, and is what slow and stuck are measured on.</p>
+    </div>
+    <div class="scroll">
+      <table id="inflight">
+        <thead><tr>
+          <th scope="col">State</th><th scope="col" class="num">Waiting</th>
+          <th scope="col" class="num">Silent</th><th scope="col">User</th>
+          <th scope="col">Session</th><th scope="col">Model</th>
+          <th scope="col">Backend</th><th scope="col" class="num">Received</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="users-h">
+    <div class="panel-head">
+      <h2 id="users-h">Users</h2>
+      <p class="hint">Named by Open WebUI's forwarded user headers, or an
+        <code>X-LLM-Router-User</code> header; otherwise by the address they connect from.
+        Select a user to see only their sessions.</p>
+    </div>
+    <div class="scroll">
+      <table id="users">
+        <thead><tr>
+          <th scope="col">User</th><th scope="col">Clients</th>
+          <th scope="col" class="num">Sessions</th><th scope="col" class="num">In flight</th>
+          <th scope="col" class="num">Longest wait</th><th scope="col" class="num">Requests</th>
+          <th scope="col" class="num">Errors</th><th scope="col" class="num">Tokens in / out</th>
+          <th scope="col" class="num">Last active</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="sessions-h">
+    <div class="panel-head">
+      <h2 id="sessions-h">Sessions</h2>
+      <input type="search" id="search" class="search" placeholder="Filter by user, session, model…"
+             aria-label="Filter sessions" autocomplete="off">
+    </div>
+    <div class="scroll">
+      <table id="sessions">
+        <thead><tr>
+          <th scope="col"><span class="sr">Expand</span></th><th scope="col">State</th>
+          <th scope="col" class="num">Waiting / idle</th><th scope="col">User</th>
+          <th scope="col">Session</th><th scope="col">Client</th><th scope="col">Model</th>
+          <th scope="col">Backend</th><th scope="col" class="num">Requests</th>
+          <th scope="col" class="num">Errors</th><th scope="col" class="num">Tokens in / out</th>
+          <th scope="col" class="num">Cache</th><th scope="col">Last result</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note" id="sessions-note"></p>
+  </section>
+
+  <section class="panel" aria-labelledby="recent-h">
+    <div class="panel-head">
+      <h2 id="recent-h">Recent requests</h2>
+      <label class="toggle"><input type="checkbox" id="errors-only"> Errors only</label>
+    </div>
+    <div class="scroll">
+      <table id="recent">
+        <thead><tr>
+          <th scope="col" class="num">Ended</th><th scope="col">User</th>
+          <th scope="col">Session</th><th scope="col">Model</th><th scope="col">Backend</th>
+          <th scope="col">Result</th><th scope="col" class="num">Queued</th>
+          <th scope="col" class="num">First byte</th><th scope="col" class="num">Total</th>
+          <th scope="col" class="num">Tokens in / out</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="legend">
+    <dl>
+      <div><dt><span class="dot waiting"></span>queued</dt><dd>Waiting for a free slot on any backend.</dd></div>
+      <div><dt><span class="dot waiting"></span>holding</dt><dd>Waiting for its pinned backend, to reuse the prompt cache there; spills elsewhere once <code>affinity_wait_ms</code> runs out.</dd></div>
+      <div><dt><span class="dot processing"></span>processing</dt><dd>Sent to a backend, nothing back yet: prefill, or the whole of a reply that isn't streamed.</dd></div>
+      <div><dt><span class="dot streaming"></span>streaming</dt><dd>Tokens are arriving.</dd></div>
+      <div><dt><span class="dot idle"></span>idle</dt><dd>Nothing in flight: the session is waiting on its client, not on the router.</dd></div>
+    </dl>
+    <p>Raw data: <a href="sessions">/sessions</a> · <a href="stats">/stats</a></p>
+  </footer>
+</main>
+</body>
+</html>
