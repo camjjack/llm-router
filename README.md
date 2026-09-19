@@ -566,6 +566,18 @@ placed are placed. That is what keeps one session's affinity wait from stalling 
 On connection errors and 429/502/503/504, the request fails over to a different backend — but only
 before the first byte has reached the client, so a stream is never silently restarted.
 
+**A client that hangs up takes its request with it**, whatever stage it has reached. Queued, it
+leaves the queue, and never takes a slot. Waiting on a backend, the upstream request is closed.
+That's how a backend learns to stop generating, and the slot is freed for the next request.
+Mid-stream, the same thing happens. This matters most for agents: pressing Esc in Claude Code, or
+stopping a reply in Open WebUI, would otherwise leave the old request running for nobody, holding
+a slot the next turn needs. These count as `abandoned` in `/stats`, and show as `cancelled` in the
+web dashboard, with the stage the client left at.
+
+This assumes a backend stops when its connection closes. vLLM does, and so do recent llama.cpp
+builds. One that keeps generating anyway stays busier than the router thinks until it finishes.
+The router already makes the same assumption when a client leaves mid-stream.
+
 ## See it work without a GPU
 
 ```bash

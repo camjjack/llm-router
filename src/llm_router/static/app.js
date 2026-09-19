@@ -170,7 +170,7 @@
   function result(r) {
     if (!r.state || !(r.state in RESULT_ICON)) return el("span", { class: "dim" }, "—");
     const why = r.state === "cancelled"
-      ? "client left"
+      ? r.note || "client left"
       : r.state === "error"
         ? [r.status, r.note].filter(Boolean).join(" ")
         : r.status && r.status !== 200 ? String(r.status) : "";

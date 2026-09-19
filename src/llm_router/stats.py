@@ -142,6 +142,9 @@ class RouterStats:
     queue_timeouts: int = 0
     retries: int = 0
     rejected_no_backend: int = 0
+    # The client hung up before its response was ready, and the router stopped
+    # working on it: dropped from the queue, or its upstream request closed.
+    abandoned: int = 0
 
     total_queue_wait_s: float = 0.0
 
@@ -177,4 +180,5 @@ class RouterStats:
             "avg_queue_wait_s": self.avg_queue_wait_s,
             "retries": self.retries,
             "rejected_no_backend": self.rejected_no_backend,
+            "abandoned": self.abandoned,
         }

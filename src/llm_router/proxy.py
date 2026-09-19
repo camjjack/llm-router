@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -65,6 +66,20 @@ HOP_BY_HOP = {
 # introduces the next one. The client's own credentials are deliberately not
 # forwarded -- each backend authenticates with its own configured key.
 FORWARDED_HEADER_PREFIXES = ("anthropic-",)
+
+
+async def _until_client_leaves(receive) -> None:
+    """Return once the client has hung up.
+
+    Only for after the request body has been read: from then on, the one thing
+    receive() can still deliver is word that the client has gone.
+    """
+    try:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+    except Exception:  # noqa: BLE001 -- never let a failure to watch look like a hang-up
+        # Can't tell. Carry on as though the client were still there.
+        await asyncio.Event().wait()
 
 
 class Router:
@@ -282,13 +297,46 @@ class Router:
             explicit,
             keys,
         )
+        # Once the body is in, the client can tell us only one more thing: that
+        # it has hung up. If it does before its response is ready, this handler
+        # is cancelled -- see the except clause.
+        handler = asyncio.current_task()
+        finished = abandoned = False
+
+        def client_left(watch: asyncio.Future) -> None:
+            nonlocal abandoned
+            # `finished` is set in the same step as the response is produced, so
+            # a hang-up noticed after that can never cancel a response on its
+            # way out.
+            if not finished and not watch.cancelled():
+                abandoned = True
+                handler.cancel()
+
+        watching = asyncio.ensure_future(_until_client_leaves(request.receive))
+        watching.add_done_callback(client_left)
         response: Response | None = None
         try:
             response = await self._route(
                 request, surface, body, requested, config, explicit, keys, tracked
             )
             return response
+        except asyncio.CancelledError:
+            # Ours, from client_left -- unless something else cancelled this
+            # handler as well (the server shutting down), which then wins.
+            if not abandoned or handler.uncancel() > 0:
+                raise
+            # Left queued, it would have gone on to take a slot; left waiting on
+            # a backend, kept that backend generating -- both for nobody. The
+            # cancellation has dropped it from the queue, or closed the upstream
+            # request, which is how a backend learns to stop.
+            tracked.note = f"client left while {tracked.state}"
+            self.stats.abandoned += 1
+            log.debug("client hung up; abandoned its request (%s)", tracked.state)
+            # Nobody will read this. 499 is nginx's "client closed request".
+            return Response(status_code=499)
         finally:
+            finished = True
+            watching.cancel()
             # A stream records its own end, once its last byte has gone out.
             if not tracked.stream_owned:
                 self.tracker.finish(
@@ -577,6 +625,12 @@ class Router:
                     surfaces.UNREACHABLE,
                 ),
             )
+        except BaseException:
+            # Cancelled because the client hung up (see _handle), or something
+            # unexpected. Either way the slot goes back; releasing is idempotent,
+            # so a path that already released it is unaffected.
+            lease.release()
+            raise
 
     async def _dispatch_buffered(
         self,

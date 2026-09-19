@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 
 import httpx
+import pytest
 from conftest import running_app
 from fake_upstream import FakeUpstream
+from starlette.requests import Request
 
 from llm_router.config import BackendConfig, Config, HealthConfig, RoutingConfig
 from llm_router.proxy import Router, create_app
+from llm_router.surfaces import OPENAI
 
 MODEL = "test-model"
 SYSTEM = {"role": "system", "content": "You are a coding agent."}
@@ -89,6 +93,8 @@ async def test_capacity_is_never_exceeded_end_to_end():
             f"capacity {upstream.max_concurrency}"
         )
         assert upstream.overload_responses == 0, f"{upstream.name} had to reject work"
+    # Every client stayed for its answer, so nothing may be taken for abandoned.
+    assert router.stats.abandoned == 0
 
     # Work actually spread out rather than piling on one host.
     assert all(u.total_requests > 0 for u in upstreams)
@@ -242,6 +248,126 @@ async def test_client_disconnect_releases_the_slot():
             client.post("/v1/chat/completions", json=turn(1, seed="after")), timeout=5.0
         )
         assert follow.status_code == 200
+
+
+async def test_client_leaving_while_queued_is_dropped_from_the_queue():
+    """A request whose client has gone must not go on to take a slot."""
+    upstream = FakeUpstream(name="a", max_concurrency=1, max_pending=0, model=MODEL, latency_s=1.5)
+    async with router_stack([upstream]) as (client, router):
+        blocker = asyncio.create_task(client.post("/v1/chat/completions", json=turn(1, seed="b")))
+        await asyncio.sleep(0.2)
+        for stream in (False, True):
+            with contextlib.suppress(httpx.TimeoutException):
+                # Gives up while still queued behind the blocker.
+                await client.post("/v1/chat/completions", json=turn(1, seed=f"q{stream}", stream=stream),
+                                  timeout=0.3)
+
+        for _ in range(50):
+            if router.scheduler.queue_depth == 0:
+                break
+            await asyncio.sleep(0.02)
+        assert router.scheduler.queue_depth == 0, "abandoned requests still queued"
+
+        assert (await blocker).status_code == 200
+        await asyncio.sleep(0.3)
+    assert upstream.total_requests == 1, "an abandoned request was sent to the backend"
+    assert router.stats.abandoned == 2
+
+
+async def test_client_leaving_while_a_backend_works_frees_the_slot():
+    """Closing the upstream request is how a backend learns to stop; the slot comes back."""
+    # max_pending=1: this fake keeps working after a disconnect, so it needs room
+    # to admit the follow-up while it does.
+    upstream = FakeUpstream(name="a", max_concurrency=1, max_pending=1, model=MODEL, latency_s=3.0)
+    async with router_stack([upstream]) as (client, router):
+        with contextlib.suppress(httpx.TimeoutException):
+            await client.post("/v1/chat/completions", json=turn(1, seed="slow"), timeout=0.3)
+
+        started = time.monotonic()
+        while router.scheduler.backends["a"].inflight and time.monotonic() - started < 2:
+            await asyncio.sleep(0.02)
+        assert router.scheduler.backends["a"].inflight == 0, "slot held for a client that left"
+        assert router.clients._upstreams["a"].users == 0, "upstream client never checked back in"
+        assert router.stats.abandoned == 1
+
+        upstream.latency_s = 0.01
+        follow = await asyncio.wait_for(
+            client.post("/v1/chat/completions", json=turn(1, seed="next")), timeout=2.0
+        )
+        assert follow.status_code == 200
+        notes = [r["note"] for r in router.tracker.snapshot()["recent"] if r["state"] == "cancelled"]
+        assert notes == ["client left while processing"]
+
+
+def asgi_request(body: dict, after_body) -> Request:
+    """A request whose receive() hands over the body, then defers to `after_body`."""
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+        return await after_body()
+
+    scope = {
+        "type": "http", "method": "POST", "path": "/v1/chat/completions", "query_string": b"",
+        "headers": [(b"content-type", b"application/json")], "client": ("10.0.0.1", 50000),
+        "server": ("router", 8080), "scheme": "http", "http_version": "1.1", "root_path": "",
+    }
+    return Request(scope, receive)
+
+
+def queued_router() -> Router:
+    """A router whose only backend is full, so anything sent to it queues."""
+    router = Router(Config(
+        backends=(BackendConfig(name="a", url="http://127.0.0.1:9", capacity=1, models=(MODEL,)),),
+        health=HealthConfig(interval_s=60),
+    ))
+    router.scheduler.backends["a"].inflight = 1
+    return router
+
+
+async def test_hang_up_while_queued_returns_at_once():
+    router = queued_router()
+    gone = asyncio.Event()
+
+    async def until_gone():
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    handler = asyncio.create_task(router._handle(asgi_request(turn(1), until_gone), OPENAI))
+    await asyncio.sleep(0.05)
+    assert router.scheduler.queue_depth == 1
+
+    gone.set()
+    response = await asyncio.wait_for(handler, timeout=1.0)
+    assert response.status_code == 499
+    assert not handler.cancelled() and handler.cancelling() == 0
+    assert router.scheduler.queue_depth == 0
+    assert router.stats.abandoned == 1
+    await router.clients.aclose()
+
+
+async def test_cancelling_the_handler_is_not_mistaken_for_a_hang_up():
+    """A server shutting down cancels handlers itself; that must still propagate."""
+    router = queued_router()
+
+    async def never():
+        await asyncio.Event().wait()
+
+    handler = asyncio.create_task(router._handle(asgi_request(turn(1), never), OPENAI))
+    await asyncio.sleep(0.05)
+    assert router.scheduler.queue_depth == 1
+
+    handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+    assert router.scheduler.queue_depth == 0
+    assert router.stats.abandoned == 0
+    [ended] = router.tracker.snapshot()["recent"]
+    assert ended["state"] == "cancelled" and ended["note"] is None
+    await router.clients.aclose()
 
 
 # -------------------------------------------------------------------- failover
