@@ -25,6 +25,7 @@
     userName: null,
     expanded: new Map(), // session n -> detail (or null while loading)
     search: "",
+    sort: "urgent",
     errorsOnly: false,
   };
 
@@ -118,6 +119,28 @@
   function tick(seconds, suffix = "", cls = "") {
     if (seconds == null) return el("span", { class: "dim" }, "—");
     return el("span", { class: `tick ${cls}`.trim(), data: { base: seconds, suffix } }, dur(seconds) + suffix);
+  }
+
+  // What a request asked the model for. "default" means it said nothing, so the
+  // backend's own settings apply.
+  function asked(r) {
+    const bits = [];
+    if (r.effort) bits.push(`effort ${r.effort}`);
+    if (r.thinking === true) bits.push(r.budget ? `thinking ${compact(r.budget)} budget` : "thinking");
+    else if (r.thinking === false) bits.push("no thinking");
+    if (r.max_tokens) bits.push(`${compact(r.max_tokens)} out`);
+    if (!bits.length) return el("span", { class: "dim" }, "default");
+    const text = bits.join(" · ");
+    return el("span", { title: `asked for: ${text}` }, text);
+  }
+
+  // Time holding a backend, and how much of it others spent queued behind.
+  function slot(r, live) {
+    const held = live ? tick(r.slot_s) : dur(r.slot_s);
+    if (!r.contended_s) return held;
+    return el("span", { class: "stack" }, held,
+      el("span", { class: "sub", title: "of that, time other requests were queued behind it" },
+        `${dur(r.contended_s)} with a queue`));
   }
 
   function severity(silence) {
@@ -300,7 +323,18 @@
       tile("Sessions", String(s.sessions || 0), `${s.busy_sessions || 0} busy`),
       tile("Queue", String(r.queue_depth || 0),
         r.waiting_on_affinity ? `${r.waiting_on_affinity} holding for a pinned host` : "requests waiting for a slot"),
+      holdingUp(d),
     );
+  }
+
+  // Whoever is keeping the queue waiting longest right now.
+  function holdingUp(d) {
+    const blocking = (d.in_flight || []).filter((r) => r.blocking);
+    if (!blocking.length) return tile("Holding up the queue", "—", "nothing is queued behind a busy backend");
+    const worst = blocking.reduce((a, b) => (b.slot_s > a.slot_s ? b : a));
+    const bits = [worst.effort ? `effort ${worst.effort}` : null,
+      `held ${dur(worst.slot_s)}`, `${worst.blocking} waiting`].filter(Boolean);
+    return tile("Holding up the queue", worst.user_name, bits.join(" · "));
   }
 
   function renderBackends(d) {
@@ -316,7 +350,8 @@
         el("div", { class: "row" },
           bad ? icon("error") : null,
           el("span", { class: "bname", title: b.name }, b.name),
-          el("span", { class: `bstate ${bad ? "bad" : ""}`.trim() }, status || (full ? "full" : ""))),
+          el("span", { class: `bstate ${bad ? "bad" : ""}`.trim() },
+            status || (b.waiting ? `${b.waiting} queued` : full ? "full" : ""))),
         el("div", {
           class: `meter ${full ? "full" : ""} ${bad || b.draining ? "off" : ""}`.trim(),
           role: "meter", "aria-valuemin": 0, "aria-valuemax": b.capacity, "aria-valuenow": b.inflight,
@@ -353,10 +388,16 @@
           sessionCell(r.session_id, r.session, r.session_via, 0),
           r.agent ? el("span", { class: "sub mono", title: r.agent }, `agent ${r.agent.slice(0, 8)}`) : null)),
         el("td", {}, r.model),
-        el("td", {}, backend),
+        el("td", {}, asked(r)),
+        el("td", {}, backend,
+          r.blocking
+            ? el("span", { class: "badge soft", title: `${r.blocking} request(s) queued for this backend` },
+              `${r.blocking} waiting`)
+            : null),
+        el("td", { class: "num" }, slot(r, true)),
         el("td", { class: "num" }, size(r.bytes)));
     });
-    fill("inflight", rows.length ? rows : [empty(8, ui.user ? "Nothing in flight for this user." : "Nothing in flight.")]);
+    fill("inflight", rows.length ? rows : [empty(10, ui.user ? "Nothing in flight for this user." : "Nothing in flight.")]);
   }
 
   function renderUsers(d) {
@@ -374,10 +415,18 @@
         el("td", { class: "num" }, u.longest_wait_s != null ? tick(u.longest_wait_s) : el("span", { class: "dim" }, "—")),
         el("td", { class: "num" }, compact(u.requests)),
         el("td", { class: "num" }, u.errors ? String(u.errors) : el("span", { class: "dim" }, "0")),
+        el("td", {}, asked({
+          effort: u.efforts.join(" / ") || null, thinking: u.thinking, budget: u.budget,
+        })),
+        el("td", { class: "num" }, dur(u.slot_s)),
+        el("td", { class: "num", title: "time this user's requests kept others queued" },
+          u.contended_s ? dur(u.contended_s) : el("span", { class: "dim" }, "—")),
+        el("td", { class: "num", title: "time this user's own requests spent queued" },
+          u.queued_s ? dur(u.queued_s) : el("span", { class: "dim" }, "—")),
         el("td", { class: "num" }, tokens(u.prompt_tokens, u.completion_tokens)),
         el("td", { class: "num" }, u.in_flight ? "now" : tick(u.idle_s, " ago")));
     });
-    fill("users", rows.length ? rows : [empty(9, "No users yet. They appear here with their first request.")]);
+    fill("users", rows.length ? rows : [empty(13, "No users yet. They appear here with their first request.")]);
   }
 
   function matches(s) {
@@ -391,14 +440,23 @@
 
   function renderSessions(d) {
     const list = (d.sessions || []).filter((s) => mine(s) && matches(s));
-    // Worst first: stuck, slow, other busy by wait, then idle by recency.
-    list.sort((a, b) => {
-      const sa = SESSION_ORDER[severity(a.silence_s)] ?? (a.in_flight ? 2 : 3);
-      const sb = SESSION_ORDER[severity(b.silence_s)] ?? (b.in_flight ? 2 : 3);
-      if (sa !== sb) return sa - sb;
-      if (a.in_flight) return (b.waiting_s || 0) - (a.waiting_s || 0);
-      return a.idle_s - b.idle_s;
-    });
+    const by = {
+      contended: (s) => s.contended_s,
+      slot: (s) => s.slot_s,
+      tokens: (s) => s.prompt_tokens + s.completion_tokens,
+    }[ui.sort];
+    if (by) {
+      list.sort((a, b) => by(b) - by(a));
+    } else {
+      // Worst first: stuck, slow, other busy by wait, then idle by recency.
+      list.sort((a, b) => {
+        const sa = SESSION_ORDER[severity(a.silence_s)] ?? (a.in_flight ? 2 : 3);
+        const sb = SESSION_ORDER[severity(b.silence_s)] ?? (b.in_flight ? 2 : 3);
+        if (sa !== sb) return sa - sb;
+        if (a.in_flight) return (b.waiting_s || 0) - (a.waiting_s || 0);
+        return a.idle_s - b.idle_s;
+      });
+    }
 
     const rows = [];
     for (const s of list) {
@@ -420,17 +478,20 @@
         el("td", {}, userButton(s.user, s.user_name, null)),
         el("td", {}, sessionCell(s.id, s.n, s.via, s.agents)),
         el("td", {}, s.client || "—"),
-        el("td", { title: s.models.join(", ") }, s.models[s.models.length - 1] || "—",
-          s.models.length > 1 ? el("span", { class: "sub" }, ` +${s.models.length - 1}`) : null),
+        el("td", { title: s.models.join(", ") }, el("span", { class: "stack" },
+          el("span", {}, s.models[s.models.length - 1] || "—",
+            s.models.length > 1 ? el("span", { class: "sub" }, ` +${s.models.length - 1}`) : null),
+          el("span", { class: "sub" }, asked(s)))),
         el("td", {}, s.backend || el("span", { class: "dim" }, "—")),
         el("td", { class: "num" }, compact(s.requests)),
         el("td", { class: "num" }, s.errors ? String(s.errors) : el("span", { class: "dim" }, "0")),
+        el("td", { class: "num" }, slot(s, false)),
         el("td", { class: "num" }, tokens(s.prompt_tokens, s.completion_tokens)),
         el("td", { class: "num", title: "Share of prompt tokens served from the backend's prefix cache" }, pct(s.cache_rate)),
         el("td", {}, result(lastRequest))));
       if (open) rows.push(detailRow(s.n, ui.expanded.get(s.n)));
     }
-    fill("sessions", rows.length ? rows : [empty(13,
+    fill("sessions", rows.length ? rows : [empty(14,
       ui.search || ui.user ? "No sessions match." : "No sessions yet.")]);
 
     const total = (d.summary || {}).sessions || 0;
@@ -450,8 +511,10 @@
         el("td", { class: "mono", title: r.agent || "main conversation" }, r.agent ? r.agent.slice(0, 8) : "main"),
         el("td", {}, r.model),
         el("td", {}, r.backend || el("span", { class: "dim" }, "—")),
+        el("td", {}, asked(r)),
         el("td", { class: "num" }, dur(r.queue_s)),
         el("td", { class: "num" }, dur(r.ttft_s)),
+        el("td", { class: "num" }, slot(r, live)),
         el("td", { class: "num" }, live ? tick(r.waiting_s) : dur(r.duration_s)),
         el("td", { class: "num" }, tokens(r.prompt_tokens, r.completion_tokens)),
         el("td", { class: "num" }, r.cached_tokens != null && r.prompt_tokens
@@ -461,7 +524,7 @@
 
   function detailRow(n, detail) {
     if (!detail) {
-      return el("tr", { class: "detail" }, el("td", { colspan: 13 }, el("span", { class: "dim" }, "Loading…")));
+      return el("tr", { class: "detail" }, el("td", { colspan: 14 }, el("span", { class: "dim" }, "Loading…")));
     }
     const facts = [
       ["Session id", detail.id || "none", "mono"],
@@ -475,14 +538,16 @@
       facts.push(["Subagents", detail.agent_ids.map((a) => a.slice(0, 8)).join(", "), "mono"]);
     }
     const requests = [...detail.active, ...detail.recent];
-    const head = ["Ended", "Result", "Agent", "Model", "Backend", "Queued", "First byte", "Total", "Tokens in / out", "Cache"];
-    const numeric = new Set(["Ended", "Queued", "First byte", "Total", "Tokens in / out", "Cache"]);
-    return el("tr", { class: "detail" }, el("td", { colspan: 13 },
+    const head = ["Ended", "Result", "Agent", "Model", "Backend", "Asked for", "Queued",
+      "First byte", "Holding slot", "Total", "Tokens in / out", "Cache"];
+    const numeric = new Set(["Ended", "Queued", "First byte", "Holding slot", "Total",
+      "Tokens in / out", "Cache"]);
+    return el("tr", { class: "detail" }, el("td", { colspan: 14 },
       el("dl", { class: "facts" }, facts.map(([k, v, cls]) =>
         el("div", {}, el("dt", {}, k), el("dd", { class: cls || null }, v)))),
       el("div", { class: "scroll" }, el("table", {},
         el("thead", {}, el("tr", {}, head.map((h) => el("th", { scope: "col", class: numeric.has(h) ? "num" : null }, h)))),
-        el("tbody", {}, requests.length ? requestRows(requests) : empty(10, "No requests remembered for this session."))))));
+        el("tbody", {}, requests.length ? requestRows(requests) : empty(12, "No requests remembered for this session."))))));
   }
 
   function renderRecent(d) {
@@ -495,11 +560,12 @@
         el("td", {}, r.model),
         el("td", {}, r.backend || el("span", { class: "dim" }, "—")),
         el("td", {}, result(r)),
+        el("td", {}, asked(r)),
         el("td", { class: "num" }, dur(r.queue_s)),
         el("td", { class: "num" }, dur(r.ttft_s)),
         el("td", { class: "num" }, dur(r.duration_s)),
         el("td", { class: "num" }, tokens(r.prompt_tokens, r.completion_tokens))));
-    fill("recent", rows.length ? rows : [empty(10, ui.errorsOnly ? "No recent errors." : "No finished requests yet.")]);
+    fill("recent", rows.length ? rows : [empty(11, ui.errorsOnly ? "No recent errors." : "No finished requests yet.")]);
   }
 
   // ------------------------------------------------------------ interaction
@@ -603,6 +669,11 @@
 
   $("search").addEventListener("input", (event) => {
     ui.search = event.target.value.trim().toLowerCase();
+    render();
+  });
+
+  $("sort").addEventListener("change", (event) => {
+    ui.sort = event.target.value;
     render();
   });
 

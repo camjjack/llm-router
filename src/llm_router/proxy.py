@@ -455,7 +455,13 @@ class Router:
             self._record_lease(lease, pinned=preferred is not None)
             if failures:
                 self.stats.retries += 1
-            tracked.dispatched(lease.name, lease.queue_wait_s)
+            tracked.dispatched(
+                lease.name,
+                lease.queue_wait_s,
+                # Its share of the time this backend spends full with a queue
+                # behind it: what holding this slot costs everyone else.
+                lambda state=lease.backend: self.scheduler.contended_seconds(state),
+            )
 
             outcome, response = await self._dispatch(
                 lease, body, streaming, keys, surface, request, min_depth, model, tracked
@@ -986,6 +992,8 @@ class Router:
                 "healthy": state.healthy,
                 "cooling_down": state.cooldown_until > now,
                 "draining": False,
+                "waiting": sched.waiting_for(state),
+                "contended_s": round(sched.contended_seconds(state), 2),
             }
             for name, state in sched.backends.items()
         ]
@@ -1000,7 +1008,15 @@ class Router:
             }
             for state in sched.draining
         )
-        return self.tracker.snapshot() | {
+        data = self.tracker.snapshot()
+        for view in data["in_flight"]:
+            # How many requests are queued behind this one, on a backend that
+            # has no free slot for them.
+            state = sched.backends.get(view["backend"]) if view["backend"] else None
+            view["blocking"] = (
+                sched.waiting_for(state) if state is not None and state.free == 0 else 0
+            )
+        return data | {
             "router": {
                 "now": time.time(),
                 "uptime_s": now - self.stats.started_at,

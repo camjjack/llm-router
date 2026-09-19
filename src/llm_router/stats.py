@@ -29,6 +29,8 @@ class TokenUsage:
     prompt_tokens: int
     completion_tokens: int = 0
     cached_tokens: int | None = None
+    # The thinking part of completion_tokens, where a backend reports it.
+    reasoning_tokens: int | None = None
 
 
 @dataclass

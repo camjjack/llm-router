@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections import OrderedDict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -124,6 +124,59 @@ def _r(seconds: float) -> float:
     return round(seconds, 2)
 
 
+def _first_str(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def reasoning_settings(body: dict[str, Any]) -> tuple[str | None, bool | None, int | None, int | None]:
+    """How hard this request asked the model to think, and how much to write.
+
+    Returns (effort, thinking, thinking budget, max output tokens). Every client
+    and engine spells these differently -- OpenAI's reasoning_effort, Anthropic's
+    thinking block and output_config.effort, and the chat_template_kwargs that
+    vLLM and llama.cpp pass to the template -- so all of the spellings are read
+    and reported the same way. A session asking for max effort on every turn is
+    the one to find when a queue builds up.
+    """
+    def mapping(key: str) -> dict[str, Any]:
+        value = body.get(key)
+        return value if isinstance(value, dict) else {}
+
+    kwargs, reasoning = mapping("chat_template_kwargs"), mapping("reasoning")
+    thinking, output = mapping("thinking"), mapping("output_config")
+
+    effort = _first_str(
+        body.get("reasoning_effort"), reasoning.get("effort"),
+        output.get("effort"), kwargs.get("reasoning_effort"),
+    )
+    on: bool | None = None
+    kind = thinking.get("type")
+    if isinstance(kind, str):
+        # Anthropic: enabled, adaptive, or disabled.
+        on = kind != "disabled"
+    else:
+        for value in (kwargs.get("enable_thinking"), kwargs.get("thinking"),
+                      body.get("enable_thinking"), reasoning.get("enabled")):
+            if isinstance(value, bool):
+                on = value
+                break
+    budget = _first_int(
+        thinking.get("budget_tokens"), body.get("thinking_budget"),
+        kwargs.get("thinking_budget"), reasoning.get("max_tokens"),
+    )
+    return effort, on, budget, _first_int(body.get("max_tokens"), body.get("max_completion_tokens"))
+
+
 @dataclass(slots=True, eq=False)
 class Session:
     key: tuple[str, str]
@@ -146,9 +199,20 @@ class Session:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    reasoning_tokens: int = 0
     # Prompt tokens of the requests that reported cache counts at all, so the hit
     # rate is not diluted by ones that said nothing.
     cache_basis: int = 0
+    # Seconds of backend slot held, and how much of that was while other
+    # requests for the same model were queued behind it.
+    slot_s: float = 0.0
+    contended_s: float = 0.0
+    queued_s: float = 0.0
+    # What its latest request asked for; see reasoning_settings.
+    effort: str | None = None
+    thinking: bool | None = None
+    budget: int | None = None
+    max_tokens: int | None = None
     backend: str | None = None
     models: list[str] = field(default_factory=list)
     agents: set[str] = field(default_factory=set)
@@ -173,6 +237,16 @@ class Tracked:
     hold_until: float = 0.0
     backend: str | None = None
     queue_s: float = 0.0
+    # When the current attempt got its slot, and the clocks that measure it.
+    dispatched_at: float | None = None
+    slot_s: float = 0.0
+    contended_s: float = 0.0
+    _contention: Callable[[], float] | None = None
+    _contended_from: float = 0.0
+    effort: str | None = None
+    thinking: bool | None = None
+    budget: int | None = None
+    max_tokens: int | None = None
     first_byte_at: float | None = None
     last_byte_at: float | None = None
     bytes: int = 0
@@ -187,19 +261,47 @@ class Tracked:
     stream_owned: bool = False
 
     def queued(self, pinned: str | None, hold_s: float) -> None:
+        # On a retry, the slot from the previous attempt has already gone back.
+        self.release_slot()
         now = time.monotonic()
         self.state = QUEUED
         self.state_at = now
         self.pinned = pinned
         self.hold_until = now + hold_s if pinned is not None else 0.0
 
-    def dispatched(self, backend: str, queue_s: float) -> None:
+    def dispatched(
+        self, backend: str, queue_s: float, contention: Callable[[], float] | None = None
+    ) -> None:
+        now = time.monotonic()
         self.state = PROCESSING
-        self.state_at = time.monotonic()
+        self.state_at = now
         self.backend = backend
         self.attempts += 1
         self.queue_s += queue_s
+        self.dispatched_at = now
+        # Read now, so what this request is charged is the stretch it was there for.
+        self._contention = contention
+        self._contended_from = contention() if contention is not None else 0.0
         self.session.backend = backend
+
+    def release_slot(self) -> None:
+        """Stop the slot clocks: the backend has this slot back."""
+        if self.dispatched_at is None:
+            return
+        self.slot_s = self.slot_held()
+        self.contended_s = self.contended_held()
+        self.dispatched_at = None
+        self._contention = None
+
+    def slot_held(self, now: float | None = None) -> float:
+        if self.dispatched_at is None:
+            return self.slot_s
+        return self.slot_s + (now or time.monotonic()) - self.dispatched_at
+
+    def contended_held(self) -> float:
+        if self._contention is None:
+            return self.contended_s
+        return self.contended_s + max(0.0, self._contention() - self._contended_from)
 
     def received(self, size: int) -> None:
         now = time.monotonic()
@@ -347,6 +449,9 @@ class SessionTracker:
         session.requests += 1
 
         tracked = Tracked(next(self._request_ids), session, model, stream, agent, now, state_at=now)
+        tracked.effort, tracked.thinking, tracked.budget, tracked.max_tokens = reasoning_settings(body)
+        session.effort, session.thinking = tracked.effort, tracked.thinking
+        session.budget, session.max_tokens = tracked.budget, tracked.max_tokens
         session.active[tracked.id] = tracked
         self._active[tracked.id] = tracked
         return tracked
@@ -356,6 +461,7 @@ class SessionTracker:
         if self._active.pop(tracked.id, None) is None:
             # Already finished, or tracking was switched off while it ran.
             return
+        tracked.release_slot()
         now = time.monotonic()
         if outcome is None:
             outcome = CANCELLED if status is None else OK if status < 400 else ERROR
@@ -366,6 +472,9 @@ class SessionTracker:
         session = tracked.session
         session.active.pop(tracked.id, None)
         session.last_active = now
+        session.slot_s += tracked.slot_s
+        session.contended_s += tracked.contended_s
+        session.queued_s += tracked.queue_s
         if outcome == ERROR:
             session.errors += 1
         usage = tracked.usage
@@ -375,6 +484,8 @@ class SessionTracker:
             if usage.cached_tokens is not None and usage.cached_tokens >= 0:
                 session.cached_tokens += min(usage.cached_tokens, usage.prompt_tokens)
                 session.cache_basis += usage.prompt_tokens
+            if usage.reasoning_tokens:
+                session.reasoning_tokens += max(0, usage.reasoning_tokens)
         session.recent.append(tracked)
         self._recent.append(tracked)
         if self._sessions.get(session.key) is session:
@@ -494,6 +605,13 @@ class SessionTracker:
                     "errors": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "slot_s": 0.0,
+                    "contended_s": 0.0,
+                    "queued_s": 0.0,
+                    "efforts": [],
+                    "thinking": None,
+                    "budget": None,
                     "idle_s": now - s.last_active,
                 }
             user["sessions"] += 1
@@ -503,6 +621,17 @@ class SessionTracker:
             user["errors"] += s.errors
             user["prompt_tokens"] += s.prompt_tokens
             user["completion_tokens"] += s.completion_tokens
+            user["reasoning_tokens"] += s.reasoning_tokens
+            user["slot_s"] += s.slot_s
+            user["contended_s"] += s.contended_s
+            user["queued_s"] += s.queued_s
+            if s.effort and s.effort not in user["efforts"] and len(user["efforts"]) < 4:
+                user["efforts"].append(s.effort)
+            # Thinking at all outweighs not, and the largest budget asked for stands.
+            if s.thinking is not None and not user["thinking"]:
+                user["thinking"] = s.thinking
+            if s.budget and s.budget > (user["budget"] or 0):
+                user["budget"] = s.budget
             user["idle_s"] = min(user["idle_s"], now - s.last_active)
             if s.client and s.client not in user["clients"] and len(user["clients"]) < 4:
                 user["clients"].append(s.client)
@@ -522,12 +651,19 @@ class SessionTracker:
                 user["longest_wait_s"] = view["waiting_s"]
 
         # Whoever has something stuck first, then whoever is busiest.
+        # A user's in-flight requests are on their sessions' views, not here.
+        for view in in_flight:
+            user = users.get(view["user"])
+            if user is not None:
+                user["slot_s"] += view["slot_s"]
+                user["contended_s"] += view["contended_s"]
         ordered = sorted(
             users.values(),
             key=lambda u: (-u["stuck"], -u["slow"], -u["in_flight"], u["idle_s"]),
         )
         for user in ordered:
-            user["idle_s"] = _r(user["idle_s"])
+            for key in ("idle_s", "slot_s", "contended_s", "queued_s"):
+                user[key] = _r(user[key])
         return ordered
 
     def _session_view(
@@ -549,7 +685,13 @@ class SessionTracker:
             "errors": s.errors,
             "prompt_tokens": s.prompt_tokens,
             "completion_tokens": s.completion_tokens,
+            "reasoning_tokens": s.reasoning_tokens,
             "cache_rate": (s.cached_tokens / s.cache_basis) if s.cache_basis else None,
+            "effort": s.effort,
+            "thinking": s.thinking,
+            "budget": s.budget,
+            "max_tokens": s.max_tokens,
+            "queued_s": _r(s.queued_s),
             "first_seen_s": _r(now - s.first_seen),
             "idle_s": _r(now - s.last_active),
             "in_flight": len(s.active),
@@ -559,6 +701,8 @@ class SessionTracker:
             "waiting_s": None,
             "silence_s": None,
         }
+        # Slots its finished requests held, plus what it is holding right now.
+        slot_s, contended_s = s.slot_s, s.contended_s
         # A session is as far along as its most worrying request: the one that
         # has heard nothing for longest.
         worst = None
@@ -566,6 +710,8 @@ class SessionTracker:
             current = by_request.get(request_id)
             if current is None:
                 continue
+            slot_s += current["slot_s"]
+            contended_s += current["contended_s"]
             if view["waiting_s"] is None or current["waiting_s"] > view["waiting_s"]:
                 view["waiting_s"] = current["waiting_s"]
             if worst is None or current["silence_s"] > worst["silence_s"]:
@@ -575,6 +721,8 @@ class SessionTracker:
             view["silence_s"] = worst["silence_s"]
             view["stream"] = worst["stream"]
             view["pinned"] = worst["pinned"]
+        view["slot_s"] = _r(slot_s)
+        view["contended_s"] = _r(contended_s)
         return view
 
     def _request_view(self, t: Tracked, now: float) -> dict[str, Any]:
@@ -595,6 +743,12 @@ class SessionTracker:
             "queue_s": _r(t.queue_s),
             "ttft_s": _r(t.first_byte_at - t.started_at) if t.first_byte_at is not None else None,
             "bytes": t.bytes,
+            "effort": t.effort,
+            "thinking": t.thinking,
+            "budget": t.budget,
+            "max_tokens": t.max_tokens,
+            "slot_s": _r(t.slot_held(now)),
+            "contended_s": _r(t.contended_held()),
         }
         if t.ended_at is None:
             state = t.state
@@ -616,4 +770,5 @@ class SessionTracker:
             view["prompt_tokens"] = usage.prompt_tokens if usage else None
             view["completion_tokens"] = usage.completion_tokens if usage else None
             view["cached_tokens"] = usage.cached_tokens if usage else None
+            view["reasoning_tokens"] = usage.reasoning_tokens if usage else None
         return view

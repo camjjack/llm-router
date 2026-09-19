@@ -31,12 +31,14 @@ from llm_router.config import (
 from llm_router.dashboard import QuietAccessLog, SnapshotCache
 from llm_router.proxy import Router, create_app
 from llm_router.surfaces import ANTHROPIC, OPENAI
+from llm_router.stats import TokenUsage
 from llm_router.tracking import (
     CANCELLED,
     ERROR,
     OK,
     SessionTracker,
     inferred_session_id,
+    reasoning_settings,
 )
 
 MODEL = "test-model"
@@ -283,6 +285,60 @@ def test_users_with_something_stuck_are_listed_first():
     assert [u["name"] for u in tracker.snapshot()["users"]] == ["quiet", "busy"]
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # OpenAI, as vLLM and most clients send it.
+        ({"reasoning_effort": "high", "max_tokens": 32768}, ("high", None, None, 32768)),
+        # Anthropic, as Claude Code sends it.
+        ({"thinking": {"type": "enabled", "budget_tokens": 16000}}, (None, True, 16000, None)),
+        ({"thinking": {"type": "disabled"}}, (None, False, None, None)),
+        ({"output_config": {"effort": "max"}}, ("max", None, None, None)),
+        # Passed through to the chat template by vLLM and llama.cpp.
+        ({"chat_template_kwargs": {"enable_thinking": False}}, (None, False, None, None)),
+        ({"reasoning": {"effort": "low", "max_tokens": 1024}}, ("low", None, 1024, None)),
+        ({"max_completion_tokens": 8192}, (None, None, None, 8192)),
+        # clear_thinking is not a switch for thinking itself.
+        ({"chat_template_kwargs": {"clear_thinking": True}}, (None, None, None, None)),
+        ({}, (None, None, None, None)),
+    ],
+)
+def test_reasoning_settings_are_read_however_they_are_spelled(body, expected):
+    assert reasoning_settings(body) == expected
+
+
+def test_a_session_shows_what_its_requests_ask_for():
+    tracker = SessionTracker(TrackingConfig())
+    body = chat("think hard") | {"reasoning_effort": "max", "max_tokens": 32768,
+                                 "chat_template_kwargs": {"enable_thinking": True}}
+    tracked = begin(tracker, body)
+    tracked.usage = TokenUsage(prompt_tokens=100, completion_tokens=900, reasoning_tokens=800)
+    tracker.finish(tracked, 200)
+    [session] = sessions(tracker)
+    assert (session["effort"], session["thinking"], session["max_tokens"]) == ("max", True, 32768)
+    assert session["reasoning_tokens"] == 800
+    [user] = tracker.snapshot()["users"]
+    assert user["efforts"] == ["max"]
+    assert user["thinking"] is True
+    assert user["reasoning_tokens"] == 800
+
+
+def test_slot_time_is_counted_while_a_backend_is_held():
+    tracker = SessionTracker(TrackingConfig())
+    contended = 0.0
+    tracked = begin(tracker, chat("a"))
+    tracked.queued(None, 1.5)
+    tracked.dispatched("a", 0.25, lambda: contended)
+    contended = 2.0  # the backend spent 2s full with a queue behind it
+    time.sleep(0.05)
+    assert tracked.slot_held() >= 0.05
+    tracker.finish(tracked, 200)
+    [session] = sessions(tracker)
+    assert session["slot_s"] >= 0.05
+    assert session["contended_s"] == 2.0
+    assert session["queued_s"] == 0.25
+
+
 def test_disabling_tracking_forgets_and_records_nothing():
     tracker = SessionTracker(TrackingConfig())
     running = begin(tracker, chat("a"))
@@ -440,6 +496,35 @@ async def test_router_rejections_are_recorded_with_a_reason():
         assert notes == {"unknown model", "queue timeout"}
         [carol] = [u for u in router.tracker.snapshot()["users"] if u["name"] == "carol"]
         assert carol["errors"] == 1
+
+
+async def test_one_session_holding_a_slot_shows_up_as_another_s_wait():
+    """Who is making whom wait: one capacity-1 backend, two users."""
+    upstream = FakeUpstream(name="a", max_concurrency=1, model=MODEL, latency_s=1.0)
+    async with router_stack([upstream]) as (client, router):
+        body = chat("think") | {"reasoning_effort": "max"}
+        hog = asyncio.create_task(client.post("/v1/chat/completions", json=body,
+                                              headers={"x-user": "hog"}))
+        await until(lambda: [r for r in in_flight(router) if r["backend"]])
+        waiter = asyncio.create_task(client.post("/v1/chat/completions", json=chat("quick"),
+                                                 headers={"x-user": "waiter"}))
+        # Once one is queued, the one holding the slot is blocking it.
+        blocking = await until(
+            lambda: [r for r in router.tracking_snapshot()["in_flight"] if r["blocking"]]
+        )
+        assert blocking[0]["user_name"] == "hog"
+        assert blocking[0]["effort"] == "max"
+        assert blocking[0]["blocking"] == 1
+        assert (await hog).status_code == 200
+        assert (await waiter).status_code == 200
+
+        users = {u["name"]: u for u in router.tracking_snapshot()["users"]}
+        assert users["hog"]["contended_s"] > 0.2
+        assert users["hog"]["efforts"] == ["max"]
+        assert users["waiter"]["queued_s"] > 0.2
+        # The one that waited did not itself keep anyone waiting.
+        assert users["waiter"]["contended_s"] == 0
+        assert users["hog"]["queued_s"] == 0
 
 
 async def test_dashboard_endpoints():

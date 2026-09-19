@@ -538,6 +538,18 @@ their sessions is doing right now, and anything that has stopped getting answers
   subagent sent each, where it ran, how long it queued, time to first token, and tokens used.
 - **Recent requests**: the last 50 to finish, which can be filtered to errors only.
 
+Each request also shows **what it asked the model for** — reasoning effort, thinking and its
+budget, and the output limit — and **how long it held a backend**, with how much of that other
+requests spent queued behind it. That is what finds the session everyone else is waiting on. Sort
+the sessions by *Made others wait*, and see the same totals per person in the users table, next to
+how long their own requests were queued.
+
+`reasoning_effort`, Anthropic's `thinking` block, `output_config.effort` and the
+`chat_template_kwargs` that vLLM and llama.cpp hand to the chat template are all read, so it does
+not matter which spelling a client uses. A model's own default applies when a request says nothing,
+and the dashboard shows that as `default`. Where a backend reports reasoning tokens separately,
+those are counted too.
+
 | State | Meaning |
 |---|---|
 | `queued` | Waiting for a free slot on any backend. |
@@ -545,6 +557,16 @@ their sessions is doing right now, and anything that has stopped getting answers
 | `processing` | Sent to a backend, nothing back yet: prefill, or the whole of a reply that isn't streamed. |
 | `streaming` | Tokens are arriving. |
 | `idle` (sessions only) | Nothing in flight. The session is waiting on its client, not on the router. |
+
+**Made others wait** is time a request held a slot on a **full** backend while something was queued
+for a model that backend serves. Every request holding one of its slots is charged that time, since
+each of them is equally in the way. A busy backend with nobody queued costs nobody anything, so it
+counts as zero.
+
+**Slow and stuck are measured on silence:** the time since the last byte came back, or since the
+request arrived if none has. A long reply that is still producing tokens is never stuck. A request
+queued for a minute, a prefill that hasn't produced a first token, or a stream that stopped
+mid-reply, is. Slow is 15s and stuck 60s by default, and stuck requests sort to the top.
 
 ### How users are identified
 
@@ -603,6 +625,9 @@ Next to nothing, by design, and measured:
 - **Per request, about 3 µs** from arrival to finish, plus about 70 ns per streamed chunk. It
   writes a few fields as a request changes state. Nothing is hashed that affinity has not already
   hashed, and nothing is sorted, aggregated or serialised on the request path.
+- **The queue's contention clock is event-driven**, not sampled: it advances when a request joins
+  or leaves the queue, or a backend fills or frees up, and each advance is one pass over the
+  backends. Nothing scans the queue, and nothing runs when the queue is empty.
 - **Watching costs well under 1% of one core.** The page polls every 2 seconds, and only while its
   tab is visible. The JSON is built at most once a second however many people are watching (every
   viewer in between gets the same bytes). Even at its full 2,000 sessions it takes about 2 ms to

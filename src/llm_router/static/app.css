@@ -172,7 +172,12 @@ main {
   padding: 4px 10px; width: min(280px, 100%);
 }
 .toggle { margin-left: auto; color: var(--ink-2); font-size: 13px; display: flex; gap: 6px; align-items: center; }
-
+.sort { margin-left: auto; color: var(--ink-2); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+.sort + .search { margin-left: 0; }
+.sort select {
+  font: inherit; font-size: 13px; color: var(--ink); background: var(--page);
+  border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px;
+}
 
 .filter {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;

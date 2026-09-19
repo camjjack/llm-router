@@ -23,6 +23,58 @@ def make_scheduler(*capacities: int) -> Scheduler:
     return Scheduler(backends, HealthConfig())
 
 
+async def test_contended_time_counts_only_a_full_backend_with_a_queue():
+    """What a request's slot costs everyone else: the time it kept a queue waiting."""
+    scheduler = make_scheduler(1)
+    await scheduler.start()
+    [state] = scheduler.backends.values()
+    try:
+        held = await scheduler.acquire(MODEL)
+        # Busy, but nobody is waiting for it.
+        await asyncio.sleep(0.1)
+        assert scheduler.contended_seconds(state) == 0
+        assert scheduler.waiting_for(state) == 0
+
+        queued = asyncio.create_task(scheduler.acquire(MODEL, timeout_s=5))
+        await asyncio.sleep(0.15)
+        assert scheduler.waiting_for(state) == 1
+        contended = scheduler.contended_seconds(state)
+        assert 0.1 < contended < 0.3, contended
+
+        held.release()
+        (await queued).release()
+        # The queue emptied, so the clock stopped where it was.
+        stopped = scheduler.contended_seconds(state)
+        await asyncio.sleep(0.1)
+        assert scheduler.contended_seconds(state) == stopped
+        assert 0.1 < stopped < 0.35, stopped
+    finally:
+        await scheduler.stop()
+
+
+async def test_a_queue_for_another_model_is_not_this_backend_s_doing():
+    scheduler = Scheduler(
+        (
+            BackendConfig(name="a", url="http://a", capacity=1, models=(MODEL,)),
+            BackendConfig(name="b", url="http://b", capacity=1, models=("other",)),
+        ),
+        HealthConfig(),
+    )
+    await scheduler.start()
+    try:
+        busy = await scheduler.acquire("other")          # fills b
+        waiting = asyncio.create_task(scheduler.acquire("other", timeout_s=5))
+        idle = await scheduler.acquire(MODEL)            # fills a, for a model nobody waits on
+        await asyncio.sleep(0.15)
+        assert scheduler.contended_seconds(scheduler.backends["a"]) == 0
+        assert scheduler.contended_seconds(scheduler.backends["b"]) > 0.1
+        idle.release()
+        busy.release()
+        (await waiting).release()
+    finally:
+        await scheduler.stop()
+
+
 async def test_never_exceeds_capacity_under_load():
     """The core guarantee: no backend is ever handed more than `capacity` at once."""
     scheduler = make_scheduler(4, 2, 4)
