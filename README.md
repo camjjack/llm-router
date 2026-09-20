@@ -72,10 +72,17 @@ uv run llm-router check -c config.yaml
 ## Run
 
 ```bash
-uv run llm-router serve -c config.yaml --tui     # with the live dashboard
-uv run llm-router serve -c config.yaml           # plain, logs to stderr
-uv run llm-router top --url http://127.0.0.1:8080   # dashboard for a running router
+uv run llm-router serve -c config.yaml           # logs to stderr
+uv run llm-router serve -c config.yaml --tui     # with the terminal dashboard
+uv run llm-router top --url http://127.0.0.1:8080   # terminal dashboard for a running router
 ```
+
+However it is started, it serves two pages of its own, no flags needed:
+
+| Page | |
+|---|---|
+| [`/connect`](#connecting-coding-agents) | ready-made configs for opencode, Claude Code, Qwen Code and Zed |
+| [`/dashboard`](#sessions-and-users-the-web-dashboard) | who is using it, what each of their sessions is doing, and what is stuck |
 
 Point a client at it:
 
@@ -85,20 +92,12 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-`opencode` — in `~/.config/opencode/opencode.json`:
+For a coding agent, open `http://127.0.0.1:8080/connect` and copy the config for it: the router
+fills in its models, their context windows and timeouts that suit its queue. opencode needs no
+copying at all — log in once, and it fetches that config from the router every time it starts:
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "local": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "llm-router",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
-      "models": { "qwen3.6-27b": { "name": "Qwen via router" } }
-    }
-  }
-}
+```bash
+opencode auth login http://127.0.0.1:8080
 ```
 
 ### As a systemd service
@@ -503,7 +502,10 @@ default, in which case use `1`). Newer builds want an auth token; set `api_key: 
 Note that LM Studio's context is whatever you allocated when *loading* the model, not the model's
 maximum — load a 128k model with an 8k context and 8k is what you get.
 
-## Reading the dashboard
+## Reading the terminal dashboard
+
+`--tui` and `llm-router top` show the pool itself: one row per backend, and a summary underneath.
+For who is *using* it, see [the web dashboard](#sessions-and-users-the-web-dashboard).
 
 | Column | Meaning |
 |---|---|
@@ -719,7 +721,7 @@ uv run pytest -q
 ## Building a wheel
 
 ```bash
-uv build          # -> dist/llm_router-0.1.0-py3-none-any.whl
+uv build          # -> dist/llm_router-0.3.0-py3-none-any.whl
 ```
 
 CI (`.github/workflows/build.yml`) builds on **ubuntu-24.04 using the system Python 3.12** — no
@@ -744,11 +746,11 @@ For a link anyone can `curl`, push a version tag. That runs the release job, whi
 wheel and sdist to a GitHub Release, and **release assets are anonymous-downloadable**:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 ```bash
-pip install https://github.com/camjjack/llm-router/releases/download/v0.1.0/llm_router-0.1.0-py3-none-any.whl
+pip install https://github.com/camjjack/llm-router/releases/download/v0.3.0/llm_router-0.3.0-py3-none-any.whl
 ```
 
 The release step is idempotent: re-running a tag build repairs a partial release rather than failing
