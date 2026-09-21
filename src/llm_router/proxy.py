@@ -777,6 +777,8 @@ class Router:
         except (httpx.HTTPError, OSError) as exc:
             # Mid-stream failure: the client has bytes already, so we cannot retry.
             failed = True
+            # The status was 200 long before this went wrong, so say what did.
+            tracked.note = f"stream broke: {type(exc).__name__}"
             log.warning("backend %s stream aborted: %r", name, exc)
             self.scheduler.note_failure(lease.backend)
         finally:

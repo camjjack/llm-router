@@ -370,6 +370,29 @@ async def test_cancelling_the_handler_is_not_mistaken_for_a_hang_up():
     await router.clients.aclose()
 
 
+async def test_a_stream_that_breaks_mid_flight_says_what_broke():
+    """It was a 200 before it broke, so "error 200" tells nobody anything."""
+    upstream = FakeUpstream(name="a", max_concurrency=1, model=MODEL, latency_s=0.2,
+                            chunks=10, abort_after=2)
+    async with router_stack([upstream]) as (client, router):
+        async with client.stream("POST", "/v1/chat/completions", json=turn(1, stream=True)) as r:
+            assert r.status_code == 200
+            with contextlib.suppress(httpx.HTTPError):
+                async for _ in r.aiter_bytes():
+                    pass
+
+        for _ in range(100):
+            if router.tracker.snapshot()["recent"]:
+                break
+            await asyncio.sleep(0.05)
+        [ended] = router.tracker.snapshot()["recent"]
+        assert ended["state"] == "error"
+        assert ended["status"] == 200
+        assert ended["note"].startswith("stream broke: ")
+        assert router.stats.backend("a").errors == 1
+        assert router.scheduler.backends["a"].inflight == 0
+
+
 # -------------------------------------------------------------------- failover
 
 

@@ -195,7 +195,8 @@
     const why = r.state === "cancelled"
       ? r.note || "client left"
       : r.state === "error"
-        ? [r.status, r.note].filter(Boolean).join(" ")
+        // A stream that broke mid-flight was a 200: the reason is the useful part.
+        ? [r.status >= 400 ? r.status : null, r.note].filter(Boolean).join(" ")
         : r.status && r.status !== 200 ? String(r.status) : "";
     return el("span", { class: "result" }, icon(RESULT_ICON[r.state]), r.state,
       why ? el("span", { class: "why" }, why) : null);

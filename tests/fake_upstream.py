@@ -81,6 +81,9 @@ class FakeUpstream:
     query_log: list[str] = field(default_factory=list)
     # Emit an SSE ping mid-stream; Claude Code needs these relayed unfiltered.
     emit_ping: bool = False
+    # Drop the connection after this many streamed chunks, as a backend that dies
+    # (or a read timeout) does: the client already has a 200 and some bytes.
+    abort_after: int | None = None
     # Report cached-token counts in usage at all. vLLM omits them entirely unless
     # started with --enable-prompt-tokens-details, and that silence must not be
     # read as "nothing was cached".
@@ -409,6 +412,8 @@ class FakeUpstream:
         async with self._slot():
             for i in range(self.chunks):
                 await asyncio.sleep(self.latency_s / max(1, self.chunks))
+                if self.abort_after is not None and i >= self.abort_after:
+                    raise RuntimeError("upstream dropped the stream")
                 chunk = {
                     "id": "chatcmpl-fake",
                     "object": "chat.completion.chunk",
