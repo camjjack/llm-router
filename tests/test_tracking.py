@@ -30,13 +30,14 @@ from llm_router.config import (
 )
 from llm_router.dashboard import QuietAccessLog, SnapshotCache
 from llm_router.proxy import Router, create_app
-from llm_router.surfaces import ANTHROPIC, OPENAI
 from llm_router.stats import TokenUsage
+from llm_router.surfaces import ANTHROPIC, OPENAI
 from llm_router.tracking import (
     CANCELLED,
     ERROR,
     OK,
     SessionTracker,
+    aliases_of,
     inferred_session_id,
     reasoning_settings,
 )
@@ -141,6 +142,76 @@ def test_coding_agent_is_named_by_header_or_else_by_address():
     assert users["alice"]["clients"] == ["opencode"]
     assert users["10.0.0.9"]["via"] == "address"
     assert users["10.0.0.9"]["clients"] == ["Claude Code"]
+
+
+OPEN_WEBUI = {
+    "x-openwebui-user-email": "alice@example.com",
+    "x-openwebui-user-id": "8d2f-uuid",
+    "x-openwebui-user-name": "Alice Smith",
+    "x-openwebui-chat-id": "chat-1",
+    "user-agent": "Python/3.11 aiohttp/3.11.18",
+}
+
+
+def test_one_person_is_one_user_whichever_client_they_use():
+    """Open WebUI names them by email; their agent sends whatever they typed."""
+    tracker = SessionTracker(TrackingConfig())
+    begin(tracker, chat("a"), OPEN_WEBUI)
+    begin(tracker, chat("b"), {"x-llm-router-user": "alice", "user-agent": "opencode/0.15"})
+    [user] = tracker.snapshot()["users"]
+    # The name they are called by wins over the address they are keyed on.
+    assert user["name"] == "Alice Smith"
+    assert user["sessions"] == 2
+    assert sorted(user["clients"]) == ["Open WebUI", "opencode"]
+
+
+def test_the_link_can_show_up_after_the_fact():
+    """The agent usually turns up first; the chat links them later."""
+    tracker = SessionTracker(TrackingConfig())
+    begin(tracker, chat("a"), {"x-user": "ALICE@example.com"})
+    assert [u["name"] for u in tracker.snapshot()["users"]] == ["ALICE@example.com"]
+    begin(tracker, chat("b"), OPEN_WEBUI)
+    [user] = tracker.snapshot()["users"]
+    assert user["name"] == "Alice Smith"
+    assert user["sessions"] == 2
+
+
+def test_different_people_are_not_linked():
+    tracker = SessionTracker(TrackingConfig())
+    begin(tracker, chat("a"), {"x-user": "alice"})
+    begin(tracker, chat("b"), {"x-user": "bob"})
+    begin(tracker, chat("c"), {"x-user": "bob.smith@example.com"})
+    assert len(tracker.snapshot()["users"]) == 3
+
+
+def test_addresses_are_never_linked_to_a_name():
+    """An address is reassigned and shared; it says nothing about who is behind it."""
+    tracker = SessionTracker(TrackingConfig())
+    begin(tracker, chat("a"), {"x-user": "alice"}, address="10.0.0.9")
+    begin(tracker, chat("b"), {}, address="10.0.0.9")
+    assert sorted(u["name"] for u in tracker.snapshot()["users"]) == ["10.0.0.9", "alice"]
+
+
+@pytest.mark.parametrize(
+    ("value", "aliases"),
+    [
+        ("Alice Smith", ["alice smith"]),
+        ("  ALICE@Example.com ", ["alice@example.com", "alice"]),
+        ("", []),
+    ],
+)
+def test_aliases_of(value, aliases):
+    assert aliases_of(value) == aliases
+
+
+def test_a_person_is_forgotten_with_their_last_session():
+    tracker = SessionTracker(TrackingConfig(max_sessions=1))
+    for i in range(5):
+        tracker.finish(begin(tracker, chat(f"s{i}"), {"x-user": f"user{i}"}), 200)
+    # One session cap, so one person, and no aliases left over from the rest.
+    assert len(tracker.snapshot()["users"]) == 1
+    assert len(tracker._people) == 1
+    assert len(tracker._alias) == 1
 
 
 def test_user_headers_are_configurable():

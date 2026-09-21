@@ -593,6 +593,18 @@ In this order:
    in `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), in which case the router uses the
    `X-Forwarded-For` it sends.
 
+**One person is one user, whichever client they are in front of.** Open WebUI names somebody by
+their email, while their coding agent sends whatever they put in the header, so anything two
+identities have in common — a name, an email, an email's local part, or an id — makes them the
+same person here. Case and spacing don't matter. Set `X-LLM-Router-User` to your Open WebUI name,
+or to the local part of your email, and your chats and your agent's sessions arrive as one user.
+The link is made whenever it turns up, so an agent that has been running for an hour joins the
+person who opens a chat later. The name shown is one a person is called by, in preference to an
+email or an id.
+
+Addresses are never linked to a name: they are reassigned and shared, and say nothing about who is
+behind them.
+
 A user name is whatever the client says it is. This is for seeing what is going on, not for access
 control.
 

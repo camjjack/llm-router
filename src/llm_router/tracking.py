@@ -93,6 +93,28 @@ def _clean(value: str) -> str:
     return value.strip()[:MAX_VALUE_CHARS]
 
 
+def aliases_of(value: str) -> list[str]:
+    """The names one identity should be recognised by.
+
+    An email also stands for its local part, since that is what people type into
+    a client's user header when their account is an address.
+    """
+    value = " ".join(value.split()).lower()
+    if not value:
+        return []
+    aliases = [value]
+    local = value.split("@", 1)[0]
+    if local and local != value:
+        aliases.append(local)
+    return aliases
+
+
+def _is_handle(value: str) -> bool:
+    """Whether this reads as something a person is called, rather than an
+    address or an id a system made up for them."""
+    return "@" not in value and not (len(value) >= 32 and "-" in value)
+
+
 def client_label(user_agent: str, open_webui: bool = False) -> str:
     if open_webui:
         return "Open WebUI"
@@ -178,6 +200,26 @@ def reasoning_settings(body: dict[str, Any]) -> tuple[str | None, bool | None, i
 
 
 @dataclass(slots=True, eq=False)
+class Person:
+    """One person, however many clients and names they arrive under.
+
+    Open WebUI sends an email, an id and a name; a coding agent sends whatever
+    its user put in a header. Anything those have in common makes them the same
+    person here, so somebody's chats and their agent's sessions are one entry.
+    """
+
+    key: str
+    name: str
+    # Where the name came from: open-webui, header, address.
+    via: str
+    aliases: set[str] = field(default_factory=set)
+    # Sessions pointing here, so a person is forgotten with their last session.
+    sessions: int = 0
+    # Whether `name` is what they are called, rather than an address or an id.
+    named: bool = False
+
+
+@dataclass(slots=True, eq=False)
 class Session:
     key: tuple[str, str]
     # A short handle for the dashboard to refer to this session by.
@@ -185,10 +227,7 @@ class Session:
     id: str
     # How the session was identified: claude-code, open-webui, header, inferred, none.
     via: str
-    user: str
-    user_name: str
-    # How the user was identified: open-webui, header, address.
-    user_via: str
+    person: Person
     address: str
     first_seen: float
     last_active: float
@@ -314,8 +353,9 @@ class Tracked:
 
 
 # Stands in for a session while tracking is off, so callers never branch on it.
+_NOBODY = Person(key="", name="", via="address")
 _DETACHED = Session(
-    key=("", ""), n=0, id="", via="none", user="", user_name="", user_via="",
+    key=("", ""), n=0, id="", via="none", person=_NOBODY,
     address="", first_seen=0.0, last_active=0.0,
 )
 
@@ -324,6 +364,9 @@ class SessionTracker:
     def __init__(self, config: TrackingConfig) -> None:
         # Least recently active first, so eviction reads from the front.
         self._sessions: OrderedDict[tuple[str, str], Session] = OrderedDict()
+        self._people: dict[str, Person] = {}
+        # Every name a person answers to -> their key.
+        self._alias: dict[str, str] = {}
         self._by_n: dict[int, Session] = {}
         self._active: dict[int, Tracked] = {}
         self._recent: deque[Tracked] = deque(maxlen=RECENT_OVERALL)
@@ -346,6 +389,8 @@ class SessionTracker:
         else:
             # Nothing is recorded while off; don't keep showing what was.
             self._sessions.clear()
+            self._people.clear()
+            self._alias.clear()
             self._by_n.clear()
             self._active.clear()
             self._recent.clear()
@@ -377,22 +422,20 @@ class SessionTracker:
             if name.startswith(_OWUI_PREFIX):
                 open_webui = True
 
-        user = ""
-        for name in self._user_headers:
-            value = found.get(name)
+        names: list[str] = []
+        for header in self._user_headers:
+            value = found.get(header)
             if value:
-                user = _clean(value.decode("latin-1"))
-                if user:
-                    break
-        if user:
-            user_key = "u:" + user
-            user_via = "open-webui" if open_webui else "header"
-            owui_name = found.get(_OWUI_NAME)
-            user_name = (_clean(owui_name.decode("latin-1")) if owui_name else "") or user
-        else:
-            user_name = address or "unknown"
-            user_key = "ip:" + user_name
-            user_via = "address"
+                cleaned = _clean(value.decode("latin-1"))
+                if cleaned and cleaned not in names:
+                    names.append(cleaned)
+        given = found.get(_OWUI_NAME)
+        person = self._person(
+            names,
+            display=(_clean(given.decode("latin-1")) if given else ""),
+            open_webui=open_webui,
+            address=address,
+        )
 
         agent = None
         if explicit is not None:
@@ -407,7 +450,7 @@ class SessionTracker:
         else:
             session_id, via = "", "none"
 
-        key = (user_key, session_id)
+        key = (person.key, session_id)
         session = self._sessions.get(key)
         if session is None:
             session = Session(
@@ -415,19 +458,17 @@ class SessionTracker:
                 n=next(self._session_numbers),
                 id=session_id,
                 via=via,
-                user=user_key,
-                user_name=user_name,
-                user_via=user_via,
+                person=person,
                 address=address or "",
                 first_seen=now,
                 last_active=now,
             )
             self._sessions[key] = session
             self._by_n[session.n] = session
+            person.sessions += 1
             self._evict(now)
         else:
             session.last_active = now
-            session.user_name = user_name
             self._sessions.move_to_end(key)
 
         raw_agent = found.get(_USER_AGENT)
@@ -455,6 +496,99 @@ class SessionTracker:
         session.active[tracked.id] = tracked
         self._active[tracked.id] = tracked
         return tracked
+
+    def _person(
+        self, names: list[str], display: str, open_webui: bool, address: str | None
+    ) -> Person:
+        """Who this request is from, linking the names they arrive under.
+
+        Anything a request says about who sent it -- an Open WebUI email, id and
+        name, or whatever a coding agent put in its user header -- is an alias.
+        Sharing one makes two identities the same person, even when the link
+        only shows up later, which is the usual way round: somebody's agent
+        turns up before they open a chat.
+        """
+        aliases: list[str] = []
+        for name in names:
+            for alias in aliases_of(name):
+                if alias not in aliases:
+                    aliases.append(alias)
+        if not aliases:
+            # Nothing but an address. Never linked to a name: addresses are
+            # reassigned, shared, and say nothing about who is behind them.
+            shown = address or "unknown"
+            key = "ip:" + shown
+            person = self._people.get(key)
+            if person is None:
+                person = self._people[key] = Person(key=key, name=shown, via="address")
+            return person
+
+        known: list[Person] = []
+        for alias in aliases:
+            match = self._people.get(self._alias.get(alias, ""))
+            if match is not None and match not in known:
+                known.append(match)
+        if known:
+            person = known[0]
+            for other in known[1:]:
+                self._absorb(person, other)
+        else:
+            person = Person(key="u:" + aliases[0], name=display or names[0],
+                            via="open-webui" if open_webui else "header")
+            self._people[person.key] = person
+        for alias in aliases:
+            self._alias[alias] = person.key
+        person.aliases.update(aliases)
+
+        # A name someone chose beats an address or an id.
+        shown = display or names[0]
+        if display or (not person.named and _is_handle(shown)):
+            person.name, person.named = shown, True
+        return person
+
+    def _absorb(self, keeper: Person, other: Person) -> None:
+        """Fold one identity into another, now that they are known to be one."""
+        for alias in other.aliases:
+            self._alias[alias] = keeper.key
+        keeper.aliases.update(other.aliases)
+        if other.named and not keeper.named:
+            keeper.name, keeper.named = other.name, True
+        for key, session in [(k, s) for k, s in self._sessions.items() if s.person is other]:
+            del self._sessions[key]
+            session.person = keeper
+            session.key = (keeper.key, session.id)
+            existing = self._sessions.get(session.key)
+            if existing is None:
+                self._sessions[session.key] = session
+            else:
+                # The same session id under both identities: one conversation.
+                self._fold(existing, session)
+        self._people.pop(other.key, None)
+        keeper.sessions = sum(1 for s in self._sessions.values() if s.person is keeper)
+
+    def _fold(self, keeper: Session, other: Session) -> None:
+        for counter in ("requests", "errors", "prompt_tokens", "completion_tokens",
+                        "cached_tokens", "reasoning_tokens", "cache_basis",
+                        "slot_s", "contended_s", "queued_s"):
+            setattr(keeper, counter, getattr(keeper, counter) + getattr(other, counter))
+        keeper.last_active = max(keeper.last_active, other.last_active)
+        for tracked in other.active.values():
+            tracked.session = keeper
+            keeper.active[tracked.id] = tracked
+        for tracked in other.recent:
+            keeper.recent.append(tracked)
+        self._by_n.pop(other.n, None)
+
+    def _forget(self, session: Session) -> None:
+        """Drop a session, and the person with their last one."""
+        del self._by_n[session.n]
+        person = session.person
+        person.sessions -= 1
+        if person.sessions <= 0 and self._people.get(person.key) is person:
+            for alias in person.aliases:
+                if self._alias.get(alias) == person.key:
+                    del self._alias[alias]
+            del self._people[person.key]
 
     def finish(self, tracked: Tracked, status: int | None, outcome: str | None = None) -> None:
         """Record how a request ended. Safe to call more than once."""
@@ -506,7 +640,7 @@ class SessionTracker:
                 sessions.move_to_end(key)
                 continue
             del sessions[key]
-            del self._by_n[oldest.n]
+            self._forget(oldest)
 
     # ---------------------------------------------------------------- snapshot
 
@@ -587,12 +721,12 @@ class SessionTracker:
     def _users(self, now: float, in_flight: list[dict[str, Any]]) -> list[dict[str, Any]]:
         users: dict[str, dict[str, Any]] = {}
         for s in self._sessions.values():
-            user = users.get(s.user)
+            user = users.get(s.person.key)
             if user is None:
-                user = users[s.user] = {
-                    "user": s.user,
-                    "name": s.user_name,
-                    "via": s.user_via,
+                user = users[s.person.key] = {
+                    "user": s.person.key,
+                    "name": s.person.name,
+                    "via": s.person.via,
                     "clients": [],
                     "addresses": [],
                     "sessions": 0,
@@ -674,8 +808,8 @@ class SessionTracker:
             "n": s.n,
             "id": s.id,
             "via": s.via,
-            "user": s.user,
-            "user_name": s.user_name,
+            "user": s.person.key,
+            "user_name": s.person.name,
             "client": s.client,
             "address": s.address,
             "models": list(s.models),
@@ -732,8 +866,8 @@ class SessionTracker:
             "session": s.n,
             "session_id": s.id,
             "session_via": s.via,
-            "user": s.user,
-            "user_name": s.user_name,
+            "user": s.person.key,
+            "user_name": s.person.name,
             "client": s.client,
             "agent": t.agent,
             "model": t.model,
