@@ -80,6 +80,7 @@ KNOWN_CLIENTS = (
     ("aider", "aider"),
     ("cline", "Cline"),
     ("zed", "Zed"),
+    ("omp/", "Oh My Pi"),
 )
 
 
