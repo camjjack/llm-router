@@ -14,12 +14,12 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 
 | Endpoint | For |
 |---|---|
-| `POST /v1/chat/completions` | opencode, aider, Cline, Continue, Zed |
+| `POST /v1/chat/completions` | opencode, Oh My Pi, aider, Cline, Continue, Zed |
 | `POST /v1/messages` | Claude Code (also `?beta=true`) |
 | `POST /v1/messages/count_tokens` | Claude Code token accounting |
 | `GET /v1/models`, `GET /health`, `GET /stats` | discovery, liveness, telemetry |
 | `GET /dashboard`, `GET /sessions` | who is using it, and what is stuck — see [the web dashboard](#sessions-and-users-the-web-dashboard) |
-| `GET /connect`, `GET /clients/<name>` | ready-made configs for opencode, Claude Code, Qwen Code and Zed — see [connecting coding agents](#connecting-coding-agents) |
+| `GET /connect`, `GET /clients/<name>` | ready-made configs for opencode, Claude Code, Qwen Code, Zed and Oh My Pi — see [connecting coding agents](#connecting-coding-agents) |
 
 | `kind` | Liveness | Load telemetry | Context from | Capacity should match |
 |---|---|---|---|---|
@@ -81,7 +81,7 @@ However it is started, it serves two pages of its own, no flags needed:
 
 | Page | |
 |---|---|
-| [`/connect`](#connecting-coding-agents) | ready-made configs for opencode, Claude Code, Qwen Code and Zed |
+| [`/connect`](#connecting-coding-agents) | ready-made configs for opencode, Claude Code, Qwen Code, Zed and Oh My Pi |
 | [`/dashboard`](#sessions-and-users-the-web-dashboard) | who is using it, what each of their sessions is doing, and what is stuck |
 
 Point a client at it:
@@ -283,7 +283,7 @@ models:
 ## Connecting coding agents
 
 Open `http://<router>:8080/connect`. It has a ready-made config for **opencode**, **Claude Code**,
-**Qwen Code** and **Zed**, with where it goes and how to install it, generated from the router's own
+**Qwen Code**, **Zed** and **Oh My Pi**, with where it goes and how to install it, generated from the router's own
 config. Each client is told the model ids, the context and output each model takes, the request
 fields a model wants, and timeouts long enough for the router's queue. Type your name in and each
 config also carries the header the [session dashboard](#sessions-and-users-the-web-dashboard) shows
@@ -292,7 +292,7 @@ you by.
 The same configs are plain files, for scripts:
 
 ```bash
-curl -s http://router:8080/clients/opencode          # also claude-code, qwen-code, zed
+curl -s http://router:8080/clients/opencode          # also claude-code, qwen-code, zed, oh-my-pi
 curl -s 'http://router:8080/clients/claude-code?user=alice&model=glm-air'
 curl -s 'http://router:8080/clients/claude-code?format=shell'   # export lines instead of JSON
 curl -s http://router:8080/clients                   # all of them, with install steps, as JSON
@@ -350,7 +350,7 @@ from behind a proxy.
 - **How long a response may go quiet** is `first_byte_s`. With vLLM and llama.cpp a response's
   headers arrive at once and prefill happens before its first chunk, so a long prefill counts
   against this. opencode's own limit is 300s, and Claude Code's stream watchdog fires after two
-  minutes.
+  minutes. Oh My Pi has one watchdog for both waits, 300s by default, so it is given the longer.
 
 ### What each client gets
 
@@ -370,6 +370,12 @@ turned up more than the documentation did:
 - **Zed** sends `reasoning_effort` but no other `request_params`. It keeps API keys out of
   `settings.json`, so it reads `<PROVIDER_ID>_API_KEY` (for example `GLM53_API_KEY`) from the
   environment.
+- **Oh My Pi** (`omp`) gets a `models.yml`, which was checked against its source rather than by
+  running it. Effort is its *thinking level*: each effort level it has a name for becomes one, the
+  configured effort is where sessions start, and Shift+Tab or `--thinking` switches. Other
+  `request_params` go in `compat.extraBody`, which it lays over every request, so an effort it has
+  no level for (such as `none`) stays there and pins the effort instead. `models.yml` can't choose
+  the default model; the connect page gives the `modelRoles` lines for `~/.omp/agent/config.yml`.
 
 ## Claude Code
 

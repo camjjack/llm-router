@@ -9,8 +9,9 @@ the first time the config changes.
 
 The formats follow each client's own documentation, checked September 2026:
 opencode (opencode.json, and its /.well-known/opencode remote config), Claude
-Code (settings.json `env`), Qwen Code (settings.json `modelProviders`) and Zed
-(settings.json `language_models.openai_compatible`).
+Code (settings.json `env`), Qwen Code (settings.json `modelProviders`), Zed
+(settings.json `language_models.openai_compatible`) and Oh My Pi (models.yml
+`providers`, checked against its source as well).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 
+import yaml
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -48,6 +50,11 @@ CLAUDE_WATCHDOG_MS = 120_000
 CLAUDE_WATCHDOG_MAX_MS = 1_800_000
 # The reasoning_effort values Zed's settings accept; anything else is dropped.
 ZED_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+# Oh My Pi's thinking levels, in its order. It has no "none": thinking off is a
+# level of its own, which sends no effort at all.
+OMP_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+# Oh My Pi's stream watchdogs: the first event, then the gap between events.
+OMP_DEFAULT_TIMEOUT_MS = 300_000
 
 
 def model_context(configured: int | None, discovered: int | None) -> tuple[int | None, str]:
@@ -453,6 +460,108 @@ def _zed_notes(setup: Setup) -> list[str]:
     return notes
 
 
+# ---------------------------------------------------------------- Oh My Pi
+
+
+def _omp_efforts(m: Model) -> list[str]:
+    """The thinking levels Oh My Pi can offer for a model, or none if a
+    configured effort would pin it anyway."""
+    if m.effort and m.effort not in OMP_EFFORTS:
+        return []
+    wanted = set(m.efforts) | ({m.effort} if m.effort else set())
+    return [e for e in OMP_EFFORTS if e in wanted]
+
+
+def oh_my_pi(setup: Setup) -> dict[str, Any]:
+    models = []
+    for m in setup.models:
+        efforts = _omp_efforts(m)
+        entry: dict[str, Any] = {
+            "id": m.id,
+            "name": m.name,
+            "reasoning": m.reasoning or bool(efforts),
+            "input": ["text", "image"] if m.images else ["text"],
+        }
+        if not m.tool_call:
+            entry["supportsTools"] = False
+        if m.context is not None:
+            entry["contextWindow"] = m.context
+        if m.max_output is not None:
+            entry["maxTokens"] = m.max_output
+        compat: dict[str, Any] = {}
+        if efforts:
+            # Oh My Pi sends the chosen level as reasoning_effort. The
+            # configured effort is where each session starts.
+            thinking: dict[str, Any] = {"mode": "effort", "efforts": efforts}
+            if m.effort:
+                thinking["defaultLevel"] = m.effort
+            entry["thinking"] = thinking
+            compat["supportsReasoningEffort"] = True
+        # extraBody is laid over the finished request, so a reasoning_effort
+        # left in it would override whichever level was picked.
+        extra = {k: v for k, v in m.request_params.items()
+                 if not (k == "reasoning_effort" and efforts)}
+        if extra:
+            compat["extraBody"] = extra
+        if compat:
+            entry["compat"] = compat
+        models.append(entry)
+
+    provider: dict[str, Any] = {
+        "baseUrl": setup.openai_url,
+        "api": "openai-completions",
+        # Taken as the name of an environment variable if one exists by that
+        # name, and otherwise as the key itself.
+        "apiKey": setup.api_key,
+    }
+    if setup.user_header:
+        # A value starting with "!" would be run as a shell command; the
+        # percent-encoding leaves none.
+        provider["headers"] = {USER_HEADER: setup.user_header}
+    # Its first-event watchdog is never shorter than its idle one, and covers
+    # the wait for response headers, so one setting covers both. A longer idle
+    # limit than the router's own costs nothing: the router gives up first.
+    wait = max(setup.header_wait_ms, setup.idle_ms)
+    if wait > OMP_DEFAULT_TIMEOUT_MS:
+        provider["compat"] = {"streamIdleTimeoutMs": wait}
+    provider["models"] = models
+    return {"providers": {setup.provider_id: provider}}
+
+
+def oh_my_pi_roles(setup: Setup) -> dict[str, Any]:
+    """The ~/.omp/agent/config.yml half: models.yml can't choose a default."""
+    roles = {"default": f"{setup.provider_id}/{setup.default.id}"}
+    if setup.small:
+        roles["smol"] = roles["tiny"] = roles["commit"] = f"{setup.provider_id}/{setup.small.id}"
+    return {"modelRoles": roles}
+
+
+def _yaml(data: Any) -> str:
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=1000)
+
+
+def _omp_notes(setup: Setup) -> list[str]:
+    notes = []
+    pinned = sorted({m.effort for m in setup.models if m.effort and m.effort not in OMP_EFFORTS})
+    if pinned:
+        notes.append(
+            f"Oh My Pi has no thinking level {', '.join(pinned)}, so reasoning_effort is "
+            "sent as configured with every request, whatever level is picked."
+        )
+    if any(_omp_efforts(m) for m in setup.models):
+        notes.append(
+            "Reasoning effort is Oh My Pi's thinking level: cycle it with Shift+Tab, start "
+            "with --thinking high, or add a suffix to a model role such as default: "
+            f"{setup.provider_id}/{setup.default.id}:high."
+        )
+    if (setup.small is None and len(setup.models) > 1):
+        notes.append(
+            "Set clients.small_model in the router's config to give Oh My Pi a model for "
+            "its background work (titles, commit messages)."
+        )
+    return notes
+
+
 # ------------------------------------------------------------------ registry
 
 
@@ -470,6 +579,7 @@ class Client:
     render: Callable[[Setup], str]
     steps: Callable[[Setup, str], list[dict[str, str]]]
     notes: Callable[[Setup], list[str]]
+    media_type: str = "application/json"
 
 
 def login_url(setup: Setup) -> str:
@@ -521,6 +631,17 @@ def _zed_steps(setup: Setup, url: str) -> list[dict[str, str]]:
     ]
 
 
+def _omp_steps(setup: Setup, url: str) -> list[dict[str, str]]:
+    return [
+        {"text": "Save it as ~/.omp/agent/models.yml if you have none; otherwise add its "
+                 f"{setup.provider_id} provider to yours. omp models lists what it loaded.",
+         "command": f"curl -s --create-dirs '{url}' -o ~/.omp/agent/models.yml"},
+        {"text": "Then make it the default in ~/.omp/agent/config.yml, or pick a model with "
+                 f"/model or --model {setup.provider_id}/{setup.default.id}:",
+         "command": _yaml(oh_my_pi_roles(setup)).rstrip("\n")},
+    ]
+
+
 CLIENTS: dict[str, Client] = {
     c.id: c
     for c in (
@@ -534,6 +655,9 @@ CLIENTS: dict[str, Client] = {
                lambda s: _json(qwen_code(s)), _qwen_steps, lambda s: []),
         Client("zed", "Zed", "~/.config/zed/settings.json", "settings.json",
                lambda s: _json(zed(s)), _zed_steps, _zed_notes),
+        Client("oh-my-pi", "Oh My Pi", "~/.omp/agent/models.yml", "models.yml",
+               lambda s: _yaml(oh_my_pi(s)), _omp_steps, _omp_notes,
+               media_type="application/yaml; charset=utf-8"),
     )
 }
 
@@ -601,7 +725,7 @@ def routes(router: Router) -> list[Route]:
         if client.id == "claude-code" and request.query_params.get("format") == "shell":
             return Response(claude_code_shell(setup), media_type="text/plain; charset=utf-8",
                             headers={"cache-control": "no-store"})
-        return Response(client.render(setup), media_type="application/json",
+        return Response(client.render(setup), media_type=client.media_type,
                         headers={"cache-control": "no-store"})
 
     async def wellknown(request: Request) -> Response:

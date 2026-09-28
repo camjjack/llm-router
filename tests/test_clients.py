@@ -13,6 +13,7 @@ import json
 
 import httpx
 import pytest
+import yaml
 from conftest import running_app
 from fake_upstream import FakeUpstream
 from starlette.requests import Request
@@ -199,6 +200,60 @@ def test_zed_leaves_out_an_effort_it_has_no_name_for():
     assert any("turbo" in note for note in clients.CLIENTS["zed"].notes(s))
 
 
+def test_oh_my_pi_models_yml():
+    config = clients.oh_my_pi(setup())
+    assert config == {
+        "providers": {
+            "glm53": {
+                "baseUrl": "http://10.0.0.1:8888/v1",
+                "api": "openai-completions",
+                "apiKey": "unused",
+                # queue_timeout_s + first_byte_s: 300s + 600s, past omp's 300s.
+                "compat": {"streamIdleTimeoutMs": 900000},
+                "models": [{
+                    "id": GLM,
+                    "name": "GLM-5.3 Flash EXL3",
+                    "reasoning": True,
+                    "input": ["text"],
+                    "contextWindow": 200000,
+                    "maxTokens": 32768,
+                    "thinking": {"mode": "effort", "efforts": ["high"], "defaultLevel": "high"},
+                    # reasoning_effort is the thinking level instead, since
+                    # extraBody would override whichever level was picked.
+                    "compat": {
+                        "supportsReasoningEffort": True,
+                        "extraBody": {"chat_template_kwargs": {"clear_thinking": True}},
+                    },
+                }],
+            }
+        }
+    }
+    assert clients.oh_my_pi_roles(setup()) == {"modelRoles": {"default": f"glm53/{GLM}"}}
+    # What is served is YAML, which is what omp reads from models.yml.
+    assert yaml.safe_load(clients.CLIENTS["oh-my-pi"].render(setup())) == config
+
+
+def test_oh_my_pi_thinking_levels_follow_reasoning_efforts():
+    text = GLM_CONFIG.replace("    request_params:", "    reasoning_efforts: [max, low, none]\n    request_params:")
+    [model] = clients.oh_my_pi(setup(text))["providers"]["glm53"]["models"]
+    # In omp's order, and without "none", which it has no level for.
+    assert model["thinking"]["efforts"] == ["low", "high", "max"]
+
+
+def test_oh_my_pi_keeps_an_effort_it_has_no_level_for():
+    text = GLM_CONFIG.replace("reasoning_effort: high", "reasoning_effort: none")
+    s = setup(text)
+    [model] = clients.oh_my_pi(s)["providers"]["glm53"]["models"]
+    assert "thinking" not in model
+    assert model["compat"]["extraBody"]["reasoning_effort"] == "none"
+    assert any("none" in note for note in clients.CLIENTS["oh-my-pi"].notes(s))
+
+
+def test_oh_my_pi_leaves_its_timeout_alone_when_the_router_waits_less():
+    text = GLM_CONFIG + "routing: {queue_timeout_s: 100}\ntimeouts: {first_byte_s: 200}\n"
+    assert "compat" not in clients.oh_my_pi(setup(text))["providers"]["glm53"]
+
+
 def test_user_name_reaches_every_client_that_can_send_it():
     s = setup(query=b"user=J%C3%B6rg%20M")
     encoded = "J%C3%B6rg M"
@@ -208,6 +263,14 @@ def test_user_name_reaches_every_client_that_can_send_it():
     assert provider["generationConfig"]["customHeaders"] == {"X-LLM-Router-User": encoded}
     zed = clients.zed(s)["language_models"]["openai_compatible"]["glm53"]
     assert zed["custom_headers"] == {"X-LLM-Router-User": encoded}
+    omp = clients.oh_my_pi(s)["providers"]["glm53"]
+    assert omp["headers"] == {"X-LLM-Router-User": encoded}
+
+
+def test_oh_my_pi_never_gets_a_header_it_would_run_as_a_command():
+    # omp runs a header value starting with "!" as a shell command.
+    s = setup(query=b"user=%21rm%20-rf")
+    assert clients.oh_my_pi(s)["providers"]["glm53"]["headers"] == {"X-LLM-Router-User": "%21rm -rf"}
 
 
 @pytest.mark.parametrize("query", [b"user=a%0Ab", b"model=nope", b"user=" + b"x" * 65])
@@ -330,7 +393,8 @@ models:
 async def test_endpoints():
     async with serving(ENDPOINT_CONFIG) as (client, _router):
         index = (await client.get("/clients", params={"user": "dana"})).json()
-        assert [c["id"] for c in index["clients"]] == ["opencode", "claude-code", "qwen-code", "zed"]
+        assert [c["id"] for c in index["clients"]] == ["opencode", "claude-code", "qwen-code", "zed",
+                                                    "oh-my-pi"]
         assert index["models"][0]["context"] == 16384
         assert index["base_url"] == str(client.base_url).rstrip("/")
         opencode = next(c for c in index["clients"] if c["id"] == "opencode")
@@ -339,6 +403,9 @@ async def test_endpoints():
 
         raw = await client.get("/clients/zed")
         assert raw.headers["content-type"].startswith("application/json")
+        omp = await client.get("/clients/oh-my-pi")
+        assert omp.headers["content-type"].startswith("application/yaml")
+        assert yaml.safe_load(omp.text)["providers"]["llm-router"]["models"][0]["id"] == "m"
         shell = await client.get("/clients/claude-code", params={"format": "shell"})
         assert shell.text.startswith("export ANTHROPIC_BASE_URL=")
         assert (await client.get("/clients/nope")).status_code == 404

@@ -110,6 +110,12 @@
     return r == null ? "—" : `${Math.round(r * 100)}%`;
   }
 
+  // Output tokens per second, as a cell: blank rather than 0 when not measured.
+  function rate(t) {
+    if (t == null || !Number.isFinite(t)) return el("span", { class: "dim" }, "—");
+    return t < 10 ? t.toFixed(1) : String(Math.round(t));
+  }
+
   function tokens(inTok, outTok) {
     if (!inTok && !outTok) return "—";
     return `${compact(inTok || 0)} / ${compact(outTok || 0)}`;
@@ -359,9 +365,22 @@
           "aria-label": `${b.name}: ${b.inflight} of ${b.capacity} slots in use`,
         },
         el("div", { class: "track" }, bar),
-        `${b.inflight} / ${b.capacity}`));
+        `${b.inflight} / ${b.capacity}`),
+        perf(b));
     });
     $("backends").replaceChildren(...cards);
+  }
+
+  // The same recent averages the terminal dashboard shows.
+  function perf(b) {
+    if (b.draining || (b.avg_ttft_s == null && b.avg_tokens_per_s == null)) return null;
+    const ttft = b.avg_ttft_s == null ? "—" : b.avg_ttft_s < 10 ? `${b.avg_ttft_s.toFixed(2)}s` : dur(b.avg_ttft_s);
+    const tps = b.avg_tokens_per_s == null ? "—" : Math.round(b.avg_tokens_per_s).toString();
+    return el("div", { class: "bperf" },
+      el("span", { title: "Mean time to first byte over its last 64 requests, from when it was sent the request: queueing isn't included" },
+        "TTFT ", el("strong", {}, ttft)),
+      el("span", { title: "Mean output tokens per second over its last 64 requests, from the first byte on" },
+        el("strong", {}, tps), " tok/s"));
   }
 
   function renderFilter() {
@@ -517,6 +536,7 @@
         el("td", { class: "num" }, dur(r.ttft_s)),
         el("td", { class: "num" }, slot(r, live)),
         el("td", { class: "num" }, live ? tick(r.waiting_s) : dur(r.duration_s)),
+        el("td", { class: "num" }, live ? rate(null) : rate(r.tokens_per_s)),
         el("td", { class: "num" }, tokens(r.prompt_tokens, r.completion_tokens)),
         el("td", { class: "num" }, r.cached_tokens != null && r.prompt_tokens
           ? pct(r.cached_tokens / r.prompt_tokens) : el("span", { class: "dim" }, "—")));
@@ -540,15 +560,15 @@
     }
     const requests = [...detail.active, ...detail.recent];
     const head = ["Ended", "Result", "Agent", "Model", "Backend", "Asked for", "Queued",
-      "First byte", "Holding slot", "Total", "Tokens in / out", "Cache"];
-    const numeric = new Set(["Ended", "Queued", "First byte", "Holding slot", "Total",
+      "First byte", "Holding slot", "Total", "Tok/s", "Tokens in / out", "Cache"];
+    const numeric = new Set(["Ended", "Queued", "First byte", "Holding slot", "Total", "Tok/s",
       "Tokens in / out", "Cache"]);
     return el("tr", { class: "detail" }, el("td", { colspan: 14 },
       el("dl", { class: "facts" }, facts.map(([k, v, cls]) =>
         el("div", {}, el("dt", {}, k), el("dd", { class: cls || null }, v)))),
       el("div", { class: "scroll" }, el("table", {},
         el("thead", {}, el("tr", {}, head.map((h) => el("th", { scope: "col", class: numeric.has(h) ? "num" : null }, h)))),
-        el("tbody", {}, requests.length ? requestRows(requests) : empty(12, "No requests remembered for this session."))))));
+        el("tbody", {}, requests.length ? requestRows(requests) : empty(13, "No requests remembered for this session."))))));
   }
 
   function renderRecent(d) {
@@ -565,8 +585,9 @@
         el("td", { class: "num" }, dur(r.queue_s)),
         el("td", { class: "num" }, dur(r.ttft_s)),
         el("td", { class: "num" }, dur(r.duration_s)),
+        el("td", { class: "num" }, rate(r.tokens_per_s)),
         el("td", { class: "num" }, tokens(r.prompt_tokens, r.completion_tokens))));
-    fill("recent", rows.length ? rows : [empty(11, ui.errorsOnly ? "No recent errors." : "No finished requests yet.")]);
+    fill("recent", rows.length ? rows : [empty(12, ui.errorsOnly ? "No recent errors." : "No finished requests yet.")]);
   }
 
   // ------------------------------------------------------------ interaction

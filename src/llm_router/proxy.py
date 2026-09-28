@@ -996,6 +996,10 @@ class Router:
                 "draining": False,
                 "waiting": sched.waiting_for(state),
                 "contended_s": round(sched.contended_seconds(state), 2),
+                # The recent averages the terminal dashboard shows, over the
+                # last 64 requests: TTFT from dispatch, so without queueing.
+                "avg_ttft_s": _rounded(self.stats.backend(name).avg_ttft_s, 2),
+                "avg_tokens_per_s": _rounded(self.stats.backend(name).avg_tokens_per_s, 1),
             }
             for name, state in sched.backends.items()
         ]
@@ -1029,6 +1033,10 @@ class Router:
             },
             "backends": backends,
         }
+
+
+def _rounded(value: float | None, digits: int) -> float | None:
+    return None if value is None else round(value, digits)
 
 
 def create_app(

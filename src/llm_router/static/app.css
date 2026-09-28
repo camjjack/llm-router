@@ -197,6 +197,8 @@ main {
 .backend .bname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .backend .bstate { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
 .backend .bstate.bad { color: var(--ink); }
+.backend .bperf { display: flex; gap: 12px; margin-top: 4px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.backend .bperf strong { color: var(--ink); font-weight: 600; }
 .meter {
   display: flex; align-items: center; gap: 8px; margin-top: 5px;
   font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums;

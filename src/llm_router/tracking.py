@@ -80,6 +80,7 @@ KNOWN_CLIENTS = (
     ("aider", "aider"),
     ("cline", "Cline"),
     ("zed", "Zed"),
+    ("omp/", "Oh My Pi"),
 )
 
 
@@ -341,6 +342,21 @@ class Tracked:
         if self._contention is None:
             return self.contended_s
         return self.contended_s + max(0.0, self._contention() - self._contended_from)
+
+    def tokens_per_s(self) -> float | None:
+        """Output speed, measured the way the backend stats measure it: a stream
+        from its first byte to its last, since everything before that is queue
+        and prefill; a buffered reply over the time it held its slot."""
+        usage = self.usage
+        if usage is None or not usage.completion_tokens:
+            return None
+        if self.stream:
+            if self.first_byte_at is None or self.last_byte_at is None:
+                return None
+            span = self.last_byte_at - self.first_byte_at
+        else:
+            span = self.slot_s
+        return round(usage.completion_tokens / span, 1) if span > 0 else None
 
     def received(self, size: int) -> None:
         now = time.monotonic()
@@ -905,4 +921,5 @@ class SessionTracker:
             view["completion_tokens"] = usage.completion_tokens if usage else None
             view["cached_tokens"] = usage.cached_tokens if usage else None
             view["reasoning_tokens"] = usage.reasoning_tokens if usage else None
+            view["tokens_per_s"] = t.tokens_per_s()
         return view
