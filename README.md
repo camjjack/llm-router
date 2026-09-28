@@ -352,6 +352,11 @@ from behind a proxy.
   against this. opencode's own limit is 300s, and Claude Code's stream watchdog fires after two
   minutes. Oh My Pi has one watchdog for both waits, 300s by default, so it is given the longer.
 
+`GET /clients` carries both, as `timeouts.header_wait_ms` and `timeouts.idle_ms`, for clients that
+configure themselves from that document rather than from a generated file. A request that doesn't
+stream gets nothing back until its reply is complete, so for it the first is the limit on the whole
+response.
+
 ### What each client gets
 
 These were checked by running each client against the router and looking at what arrived, which
@@ -739,7 +744,7 @@ uv run pytest -q
 ## Building a wheel
 
 ```bash
-uv build          # -> dist/llm_router-0.3.2-py3-none-any.whl
+uv build          # -> dist/llm_router-0.3.3-py3-none-any.whl
 ```
 
 CI (`.github/workflows/build.yml`) builds on **ubuntu-24.04 using the system Python 3.12** — no
@@ -764,11 +769,11 @@ For a link anyone can `curl`, push a version tag. That runs the release job, whi
 wheel and sdist to a GitHub Release, and **release assets are anonymous-downloadable**:
 
 ```bash
-git tag v0.3.2 && git push origin v0.3.2
+git tag v0.3.3 && git push origin v0.3.3
 ```
 
 ```bash
-pip install https://github.com/camjjack/llm-router/releases/download/v0.3.2/llm_router-0.3.2-py3-none-any.whl
+pip install https://github.com/camjjack/llm-router/releases/download/v0.3.3/llm_router-0.3.3-py3-none-any.whl
 ```
 
 The release step is idempotent: re-running a tag build repairs a partial release rather than failing
