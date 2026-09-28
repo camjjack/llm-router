@@ -95,6 +95,14 @@ class BackendStats:
         return _mean(self.cache_ratios)
 
     @property
+    def avg_ttft_s(self) -> float | None:
+        return _mean(self.ttft_s)
+
+    @property
+    def avg_tokens_per_s(self) -> float | None:
+        return _mean(self.tokens_per_s)
+
+    @property
     def error_rate(self) -> float | None:
         total = self.completed + self.errors
         return (self.errors / total) if total else None
@@ -111,8 +119,8 @@ class BackendStats:
             "overloaded": self.overloaded,
             "spilled_in": self.spilled_in,
             "error_rate": self.error_rate,
-            "avg_ttft_s": _mean(self.ttft_s),
-            "avg_tokens_per_s": _mean(self.tokens_per_s),
+            "avg_ttft_s": self.avg_ttft_s,
+            "avg_tokens_per_s": self.avg_tokens_per_s,
             "cache_hit_rate": self.cache_hit_rate,
             "prompt_tokens": self.prompt_tokens,
             "cached_tokens": self.cached_tokens,

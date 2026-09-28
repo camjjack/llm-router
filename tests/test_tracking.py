@@ -514,6 +514,10 @@ async def test_a_request_moves_through_its_states():
         assert done["alice"]["prompt_tokens"] > 0
         assert done["bob"]["queue_s"] > 0.5
         assert done["bob"]["ttft_s"] is None  # not streamed: no first-byte time
+        # Streamed: output over first byte to last. Buffered: over the slot time,
+        # the ~1.2s the fake takes, so its 5 tokens come to about 4 a second.
+        assert done["alice"]["tokens_per_s"] > 0
+        assert 2 < done["bob"]["tokens_per_s"] < 5
 
 
 async def test_a_pinned_session_shows_as_holding_for_its_host():
@@ -617,7 +621,10 @@ async def test_dashboard_endpoints():
         data = (await client.get("/sessions")).json()
         assert data["enabled"] is True
         assert data["router"]["queue_depth"] == 0
-        assert [b["name"] for b in data["backends"]] == ["a"]
+        [backend] = data["backends"]
+        assert backend["name"] == "a"
+        # The averages the terminal dashboard shows, for the backend cards.
+        assert backend["avg_ttft_s"] is not None and backend["avg_tokens_per_s"] > 0
         [session] = data["sessions"]
         assert session["user_name"] == "dana"
 
