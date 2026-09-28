@@ -396,6 +396,8 @@ async def test_endpoints():
         assert [c["id"] for c in index["clients"]] == ["opencode", "claude-code", "qwen-code", "zed",
                                                     "oh-my-pi"]
         assert index["models"][0]["context"] == 16384
+        # queue_timeout_s + first_byte_s (300s + 600s), and first_byte_s.
+        assert index["timeouts"] == {"header_wait_ms": 900_000, "idle_ms": 600_000}
         assert index["base_url"] == str(client.base_url).rstrip("/")
         opencode = next(c for c in index["clients"] if c["id"] == "opencode")
         assert "user=dana" in opencode["url"]

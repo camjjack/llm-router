@@ -689,6 +689,11 @@ def routes(router: Router) -> list[Route]:
             "default_model": setup.default.id,
             "small_model": setup.small.id if setup.small else None,
             "user": setup.user,
+            # For clients configured from this document rather than a generated
+            # file: how long a request may wait for its response to start
+            # (queued, then waiting on its backend; for a non-streamed request,
+            # the whole response), and how long a response may go quiet.
+            "timeouts": {"header_wait_ms": setup.header_wait_ms, "idle_ms": setup.idle_ms},
             "models": [
                 {
                     "id": m.id, "name": m.name, "context": m.context,

@@ -352,6 +352,11 @@ from behind a proxy.
   against this. opencode's own limit is 300s, and Claude Code's stream watchdog fires after two
   minutes. Oh My Pi has one watchdog for both waits, 300s by default, so it is given the longer.
 
+`GET /clients` carries both, as `timeouts.header_wait_ms` and `timeouts.idle_ms`, for clients that
+configure themselves from that document rather than from a generated file. A request that doesn't
+stream gets nothing back until its reply is complete, so for it the first is the limit on the whole
+response.
+
 ### What each client gets
 
 These were checked by running each client against the router and looking at what arrived, which
