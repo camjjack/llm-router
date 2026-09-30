@@ -48,12 +48,14 @@
     <div class="panel-head">
       <h2 id="models-h">Models</h2>
       <p class="hint">Context is discovered from the backends unless the router's config sets
-        it lower. Request params are sent by clients that can add fields to a request.</p>
+        it lower. Request params are sent by clients that can add fields to a request. Roles,
+        from the router's <code>clients.roles</code>, say which model each client uses for
+        what.</p>
     </div>
     <div class="scroll">
       <table id="models">
         <thead><tr>
-          <th scope="col">Model</th><th scope="col">Name</th>
+          <th scope="col">Model</th><th scope="col">Name</th><th scope="col">Roles</th>
           <th scope="col" class="num">Context</th><th scope="col" class="num">Max output</th>
           <th scope="col">Tools</th><th scope="col">Reasoning</th><th scope="col">Images</th>
           <th scope="col">Request params</th>

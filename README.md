@@ -329,8 +329,10 @@ models:
 clients:
   provider_id: glm53                  # default llm-router
   provider_name: GLM-5.3 Flash EXL3 (Sparks)
-  default_model: GLM-5.3-Flash-EXL3   # default: the first model in the config
-  small_model: GLM-5.3-Flash-EXL3     # titles, summaries, commit messages; unset = client default
+  roles:                              # which model each client uses for what; see below
+    default: GLM-5.3-Flash-EXL3       # default: the first model in the config
+    small: glm-air                    # titles, summaries, commit messages
+    thinking: {model: GLM-5.3-Flash-EXL3, effort: max}
   # base_url: http://10.0.0.1:8888    # default: the address the config was fetched from
   # api_key: unused                   # the router ignores it, but clients insist on one
 ```
@@ -338,6 +340,46 @@ clients:
 `base_url` needs setting only if people reach the router at a different address than the one the
 config is fetched from. That happens when it's fetched as `localhost` on the router's own host, or
 from behind a proxy.
+
+### Roles: which model for what
+
+Every client has some idea of using different models for different jobs: a quick one for titles,
+a strong one for planning, another for subagents. Each spells it differently. `clients.roles`
+says it once, and each generated config puts it where that client looks:
+
+| Role | For | Unset | omp | opencode | Claude Code | Qwen Code | Zed |
+|---|---|---|---|---|---|---|---|
+| `default` | the main model | first model | `default` | `model`, `build` agent | `sonnet`, start model | `model.name` | `default_model` |
+| `small` | titles, summaries, commit messages | client's choice | `smol`, `tiny`, `commit` | `small_model` | `haiku` | `fastModel` | `thread_summary_model`, `commit_message_model` |
+| `thinking` | hard problems, at the cost of speed | `default` | `slow` | via `plan` | `opus`, `fable` | — | — |
+| `plan` | planning and architecture | `thinking` | `plan` | `plan` agent | via `opus` (`opusplan`) | — | — |
+| `subagent` | delegated tasks | client's choice | `task` | `general`, `explore` agents | `CLAUDE_CODE_SUBAGENT_MODEL` | Explore subagent | `subagent_model` |
+| `vision` | reading images for a text-only model | client's choice | `vision` | — | — | `visionModel` | — |
+| `compaction` | summarising an overlong conversation | client's choice | each model's `compactionModel` | `compaction` agent | — | `compactionModel` | `compaction_model` |
+
+A role is a model id, or a model with an effort:
+
+```yaml
+clients:
+  roles:
+    default: qwen3.6-27b
+    small: qwen3-4b
+    thinking: {model: qwen3.6-27b, effort: high}   # the same model, thinking harder
+    subagent: {model: qwen3.6-27b, effort: low}
+```
+
+The effort is sent where a client can set one per role: omp as a `:high` suffix on the role,
+opencode as the agent's variant, and Zed on the model selection, for models with a
+`reasoning_effort`. It also becomes one of the model's selectable efforts, whether or not
+`reasoning_efforts` lists it. Claude Code and Qwen Code have one effort per model, so there the
+model's own default applies, and the connect page says so. It says the same for a role a client has
+no setting for.
+
+With a single model, `thinking` with a higher effort than `default` is the useful one: omp's
+thinking model, opencode's plan agent and Claude Code's `opus` all reach it.
+
+`default_model` and `small_model`, from before roles, still work as shorthands for `roles.default`
+and `roles.small`.
 
 ### Where the numbers come from
 
@@ -367,9 +409,10 @@ turned up more than the documentation did:
   (or the variant key in the TUI) switches. opencode uses the lowest variant for titles. Other
   `request_params` go in `options` and are sent. It asks for at most 32,000 output tokens, whatever
   the limit says.
-- **Claude Code** gets its `opus`, `sonnet` and `fable` aliases mapped to `default_model`, and
-  `haiku`, its background model, to `small_model`. One further model fits in the `/model` picker.
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells it when to compact. It can't send `request_params`, and it
+- **Claude Code** gets its `sonnet` alias mapped to the `default` role, `opus` and `fable` to
+  `thinking`, and `haiku`, its background model, to `small`. One further model fits in the
+  `/model` picker. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells it when to compact; it is one limit for
+  every model a conversation can move between, so it is the smallest of theirs. It can't send `request_params`, and it
   needs backends that speak the Anthropic Messages API.
 - **Qwen Code** sends `request_params` with every request, as `extra_body`.
 - **Zed** sends `reasoning_effort` but no other `request_params`. It keeps API keys out of
@@ -379,8 +422,11 @@ turned up more than the documentation did:
   running it. Effort is its *thinking level*: each effort level it has a name for becomes one, the
   configured effort is where sessions start, and Shift+Tab or `--thinking` switches. Other
   `request_params` go in `compat.extraBody`, which it lays over every request, so an effort it has
-  no level for (such as `none`) stays there and pins the effort instead. `models.yml` can't choose
-  the default model; the connect page gives the `modelRoles` lines for `~/.omp/agent/config.yml`.
+  no level for (such as `none`) stays there and pins the effort instead. `models.yml` can't assign
+  roles, so `/clients/oh-my-pi?format=config` serves the `modelRoles` lines for
+  `~/.omp/agent/config.yml`. They include `slow` and `plan` even when those only follow the
+  default: omp's own fallback for an unset role is a list of cloud models, which it would use first
+  whenever one of them is logged in.
 
 ## Claude Code
 

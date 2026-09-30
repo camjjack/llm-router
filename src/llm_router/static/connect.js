@@ -88,10 +88,25 @@
     return value ? "yes" : el("span", { class: "dim" }, "no");
   }
 
+  // What each model is for, from the router's clients.roles. A role that only
+  // falls back to another is dimmed, and shows what it follows.
+  function roles(id) {
+    const held = Object.entries(state.data.roles || {}).filter(([, r]) => r.model === id);
+    if (!held.length) return el("span", { class: "dim" }, "—");
+    return held.flatMap(([name, r], i) => [
+      i ? ", " : null,
+      el("span", {
+        class: r.configured ? null : "dim",
+        title: r.configured ? null : "not set: follows another role",
+      }, r.effort ? `${name} (${r.effort})` : name),
+    ]).filter(Boolean);
+  }
+
   function renderModels() {
     const rows = state.data.models.map((m) => el("tr", { class: "row" },
       el("td", { class: "mono" }, m.id),
       el("td", {}, m.name),
+      el("td", {}, roles(m.id)),
       el("td", { class: "num", title: `context: ${m.context_from}` },
         m.context != null ? m.context.toLocaleString() : el("span", { class: "dim" }, "unknown"),
         m.context_from === "configured" || m.context_from === "capped"

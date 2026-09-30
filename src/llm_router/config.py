@@ -173,6 +173,27 @@ class ModelConfig:
     reasoning_efforts: tuple[str, ...] = ()
 
 
+# What each model is for, in the client configs the router generates. Each client
+# has its own names and slots for these; see clients.py for how each maps.
+ROLES = (
+    "default",     # the main model
+    "small",       # quick background work: titles, summaries, commit messages
+    "thinking",    # hard problems, at the cost of speed. Unset: default
+    "plan",        # planning and architecture. Unset: thinking
+    "subagent",    # delegated tasks. Unset: each client's own choice
+    "vision",      # reading images, for a default model that can't
+    "compaction",  # summarising a conversation that has outgrown its context
+)
+
+
+@dataclass(frozen=True)
+class RoleConfig:
+    model: str
+    # A reasoning_effort for this role, for clients that can set one per role.
+    # Unset: the model's own default.
+    effort: str | None = None
+
+
 @dataclass(frozen=True)
 class ClientsConfig:
     """How the router describes itself in the client configs it generates."""
@@ -185,10 +206,10 @@ class ClientsConfig:
     provider_name: str = "llm-router"
     # The router doesn't check it, but most clients insist on having one.
     api_key: str = "unused"
-    # The model clients start on. Defaults to the first model in the config.
+    # Which model each client should use for what. See ROLES.
+    roles: dict[str, RoleConfig] = field(default_factory=dict)
+    # Shorthands for roles.default and roles.small, from before roles.
     default_model: str | None = None
-    # For background work: titles, summaries, commit messages. Clients use
-    # their own default when this is unset.
     small_model: str | None = None
 
 
@@ -401,13 +422,7 @@ def _parse_clients(raw: dict[str, Any], served: set[str]) -> ClientsConfig:
         raise ConfigError(
             "clients.provider_id may contain only letters, digits, '-' and '_'"
         )
-    for key in ("default_model", "small_model"):
-        value = getattr(clients, key)
-        if value is not None and value not in served:
-            raise ConfigError(
-                f"clients.{key} '{value}' is not served by any backend "
-                f"(known: {', '.join(sorted(served))})"
-            )
+    roles = _parse_roles(clients, served)
     base_url = clients.base_url
     if base_url is not None:
         base_url = str(base_url).rstrip("/")
@@ -420,9 +435,56 @@ def _parse_clients(raw: dict[str, Any], served: set[str]) -> ClientsConfig:
         provider_id=str(clients.provider_id),
         provider_name=str(clients.provider_name),
         api_key=str(clients.api_key),
-        default_model=clients.default_model,
-        small_model=clients.small_model,
+        roles=roles,
+        default_model=roles["default"].model if "default" in roles else None,
+        small_model=roles["small"].model if "small" in roles else None,
     )
+
+
+def _parse_roles(clients: ClientsConfig, served: set[str]) -> dict[str, RoleConfig]:
+    raw = clients.roles if clients.roles is not None else {}
+    if not isinstance(raw, dict):
+        raise ConfigError("clients.roles must be a mapping of role to model")
+    unknown = set(raw) - set(ROLES)
+    if unknown:
+        raise ConfigError(
+            f"unknown role(s) in clients.roles: {', '.join(sorted(map(str, unknown)))}. "
+            f"Valid roles: {', '.join(ROLES)}"
+        )
+    raw = dict(raw)
+    for key, role in (("default_model", "default"), ("small_model", "small")):
+        value = getattr(clients, key)
+        if value is None:
+            continue
+        if role in raw:
+            raise ConfigError(f"clients.{key} and clients.roles.{role} both set; keep one")
+        raw[role] = value
+
+    roles: dict[str, RoleConfig] = {}
+    for role in ROLES:
+        if role not in raw:
+            continue
+        value = raw[role]
+        where = f"clients.roles.{role}"
+        if isinstance(value, str):
+            value = {"model": value}
+        if not isinstance(value, dict):
+            raise ConfigError(f"{where} must be a model id, or a mapping with model and effort")
+        extra = set(value) - {"model", "effort"}
+        if extra:
+            raise ConfigError(f"unknown key(s) in {where}: {', '.join(sorted(map(str, extra)))}")
+        model, effort = value.get("model"), value.get("effort")
+        if not isinstance(model, str) or not model:
+            raise ConfigError(f"{where}.model must be a model id")
+        if model not in served:
+            raise ConfigError(
+                f"{where} '{model}' is not served by any backend "
+                f"(known: {', '.join(sorted(served))})"
+            )
+        if effort is not None and (not isinstance(effort, str) or not effort):
+            raise ConfigError(f"{where}.effort must be an effort level, such as high")
+        roles[role] = RoleConfig(model, effort)
+    return roles
 
 
 def load_config(path: str | Path) -> Config:

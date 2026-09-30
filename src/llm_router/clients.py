@@ -29,6 +29,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from .config import ROLES, RoleConfig
+
 if TYPE_CHECKING:
     from .proxy import Router
 
@@ -92,6 +94,25 @@ class Model:
         return effort if isinstance(effort, str) else None
 
 
+# Roles that fall back to another when unset. The rest stay unset, and each
+# client then does whatever it does without one.
+ROLE_FALLBACKS = {"thinking": "default", "plan": "thinking"}
+
+
+@dataclass
+class Role:
+    model: Model
+    # This role's own effort; None leaves the model's default.
+    effort: str | None
+    # Set in the router's config, rather than filled in from another role.
+    configured: bool
+
+    def selector(self, provider_id: str, suffix: Callable[[str], str | None] = lambda e: e) -> str:
+        """provider/model, with `:effort` where the client has a name for it."""
+        effort = suffix(self.effort) if self.effort else None
+        return f"{provider_id}/{self.model.id}" + (f":{effort}" if effort else "")
+
+
 @dataclass
 class Setup:
     """Everything the generators need, worked out once per request."""
@@ -102,8 +123,8 @@ class Setup:
     provider_name: str
     api_key: str
     models: list[Model]
-    default: Model
-    small: Model | None
+    # Every role with a model, after fallbacks. "default" is always here.
+    roles: dict[str, Role]
     # How long a request may take before the router sends response headers:
     # queued for a slot, then waiting on its backend.
     header_wait_ms: int
@@ -111,6 +132,18 @@ class Setup:
     idle_ms: int
     user: str | None
     warnings: list[str]
+
+    @property
+    def default(self) -> Model:
+        return self.roles["default"].model
+
+    @property
+    def small(self) -> Model | None:
+        role = self.roles.get("small")
+        return role.model if role else None
+
+    def role(self, name: str) -> Role | None:
+        return self.roles.get(name)
 
     @property
     def env_key(self) -> str:
@@ -171,10 +204,15 @@ def build_setup(router: Router, request: Request, user: str | None = None) -> Se
         ))
     by_id = {m.id: m for m in models}
 
-    default_id = request.query_params.get("model") or clients.default_model or served[0]
-    if default_id not in by_id:
-        raise BadRequest(f"no model '{default_id}' (known: {', '.join(served)})")
-    small = by_id.get(clients.small_model) if clients.small_model else None
+    configured = dict(clients.roles)
+    asked = request.query_params.get("model")
+    if asked:
+        if asked not in by_id:
+            raise BadRequest(f"no model '{asked}' (known: {', '.join(served)})")
+        # The configured effort went with the configured model, not this one.
+        kept = configured.get("default")
+        configured["default"] = kept if kept and kept.model == asked else RoleConfig(asked)
+    roles = _resolve_roles(configured, by_id, served[0], warnings)
 
     user = (user if user is not None else request.query_params.get("user") or "").strip() or None
     if user is not None and (
@@ -195,14 +233,51 @@ def build_setup(router: Router, request: Request, user: str | None = None) -> Se
         provider_name=clients.provider_name,
         api_key=clients.api_key,
         models=models,
-        default=by_id[default_id],
-        small=small,
+        roles=roles,
         header_wait_ms=round((routing.queue_timeout_s + timeouts.first_byte_s) * 1000),
         # The upstream read timeout is first_byte_s, applied to every read.
         idle_ms=round(timeouts.first_byte_s * 1000),
         user=user,
         warnings=warnings,
     )
+
+
+def _resolve_roles(
+    configured: dict[str, RoleConfig], by_id: dict[str, Model], first: str, warnings: list[str]
+) -> dict[str, Role]:
+    roles: dict[str, Role] = {}
+    for name in ROLES:
+        chosen = configured.get(name)
+        if chosen is not None:
+            roles[name] = Role(by_id[chosen.model], chosen.effort, True)
+        elif name == "default":
+            roles[name] = Role(by_id[first], None, False)
+        elif ROLE_FALLBACKS.get(name) in roles:
+            base = roles[ROLE_FALLBACKS[name]]
+            roles[name] = Role(base.model, base.effort, False)
+
+    # A role's effort is one its model can be switched to, whether or not
+    # reasoning_efforts lists it, so clients that offer a choice offer it.
+    for role in roles.values():
+        if role.effort and role.effort not in role.model.efforts:
+            role.model.efforts = (*role.model.efforts, role.effort)
+
+    vision = configured.get("vision")
+    if vision and not by_id[vision.model].images:
+        warnings.append(
+            f"clients.roles.vision is {vision.model}, which isn't marked as taking images. "
+            f"Set models['{vision.model}'].images: true if it does."
+        )
+    compaction, default = roles.get("compaction"), roles["default"].model
+    if compaction and compaction.model.context and default.context and (
+        compaction.model.context < default.context
+    ):
+        warnings.append(
+            f"clients.roles.compaction is {compaction.model.id}, with a smaller context "
+            f"({compaction.model.context}) than the default model's ({default.context}): "
+            "it can't read a conversation long enough to need compacting."
+        )
+    return roles
 
 
 # ------------------------------------------------------------------ opencode
@@ -261,13 +336,45 @@ def opencode(setup: Setup) -> dict[str, Any]:
         "model": f"{setup.provider_id}/{setup.default.id}",
     }
     if setup.small:
+        # Titles and summaries.
         config["small_model"] = f"{setup.provider_id}/{setup.small.id}"
-    if setup.default.effort:
-        # There's no global default variant; an agent's only applies to the
-        # model it is configured with.
-        chosen = {"model": config["model"], "variant": setup.default.effort}
-        config["agent"] = {"build": dict(chosen), "plan": dict(chosen)}
+    agents = _opencode_agents(setup)
+    if agents:
+        config["agent"] = agents
     return config
+
+
+def _opencode_agents(setup: Setup) -> dict[str, Any]:
+    """Roles, as opencode's built-in agents.
+
+    There's no global default variant, and an agent's only applies to the model
+    it is configured with, so an agent that should use an effort names both.
+    """
+    def pick(role: Role) -> dict[str, str]:
+        entry = {"model": f"{setup.provider_id}/{role.model.id}"}
+        # Without a variant opencode sends no reasoning_effort at all, so the
+        # model's default has to be asked for too.
+        effort = role.effort or role.model.effort
+        if effort:
+            entry["variant"] = effort
+        return entry
+
+    agents: dict[str, Any] = {}
+    default, plan = setup.roles["default"], setup.roles["plan"]
+    if default.effort or default.model.effort:
+        agents["build"] = pick(default)
+    if plan.model is not default.model or plan.effort or plan.model.effort:
+        agents["plan"] = pick(plan)
+    subagent = setup.role("subagent")
+    if subagent:
+        # Its two built-in subagents: general for delegated work, explore for
+        # searching the codebase.
+        agents["general"] = pick(subagent)
+        agents["explore"] = pick(subagent)
+    compaction = setup.role("compaction")
+    if compaction:
+        agents["compaction"] = pick(compaction)
+    return agents
 
 
 def opencode_wellknown(setup: Setup) -> dict[str, Any]:
@@ -311,6 +418,7 @@ def _opencode_notes(setup: Setup) -> list[str]:
 def claude_code_env(setup: Setup) -> dict[str, str]:
     default = setup.default
     small = setup.small or default
+    thinking = setup.roles["thinking"].model
     env = {
         "ANTHROPIC_BASE_URL": setup.base_url,
         "ANTHROPIC_AUTH_TOKEN": setup.api_key,
@@ -319,20 +427,34 @@ def claude_code_env(setup: Setup) -> dict[str, str]:
         "ANTHROPIC_DEFAULT_MODEL": default.id,
     }
     # Whichever tier Claude Code reaches for, it lands on a model the router
-    # serves. The haiku tier is also its background model.
-    for tier, model in (("OPUS", default), ("SONNET", default), ("FABLE", default), ("HAIKU", small)):
+    # serves. The haiku tier is also its background model; opus is what the
+    # opusplan alias plans with, before sonnet carries the plan out.
+    tiers = (("OPUS", thinking), ("FABLE", thinking), ("SONNET", default), ("HAIKU", small))
+    for tier, model in tiers:
         env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = model.id
         env[f"ANTHROPIC_DEFAULT_{tier}_MODEL_NAME"] = model.name
-    others = [m for m in setup.models if m.id not in (default.id, small.id)]
+    subagent = setup.role("subagent")
+    conversing = [default, thinking]
+    if subagent:
+        # For subagents that don't name a model themselves.
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent.model.id
+        conversing.append(subagent.model)
+    others = [m for m in setup.models if m.id not in {model.id for _, model in tiers}]
     if others:
         # The picker has room for exactly one model beyond the tiers.
         env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = others[0].id
         env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = others[0].name
+    # One limit covers every model a conversation can be on, so it has to fit
+    # the smallest of them.
     if default.context is not None:
         # Otherwise it compacts at whatever window it guesses for an unknown id.
-        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(default.context)
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(
+            min(m.context for m in conversing if m.context is not None)
+        )
     if default.max_output is not None:
-        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(default.max_output)
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(
+            min(m.max_output for m in conversing if m.max_output is not None)
+        )
     if setup.header_wait_ms > CLAUDE_API_TIMEOUT_MS:
         env["API_TIMEOUT_MS"] = str(setup.header_wait_ms)
     if setup.idle_ms > CLAUDE_BODY_IDLE_MS:
@@ -361,18 +483,52 @@ def _claude_notes(setup: Setup) -> list[str]:
         ("It notes an unrecognized_model at startup for any model id that isn't one of "
          "Claude's. That's expected."),
     ]
-    if any(m.request_params for m in (setup.default, setup.small) if m):
+    if any(role.model.request_params for role in setup.roles.values()):
         notes.append(
             "Claude Code can't add request_params (such as reasoning_effort) to its "
             "requests, so the backend's own defaults apply."
         )
-    others = [m.id for m in setup.models
-              if m.id not in (setup.default.id, (setup.small or setup.default).id)]
+    plan, thinking = setup.role("plan"), setup.roles["thinking"]
+    if plan and plan.configured and plan.model is not thinking.model:
+        notes.append(
+            f"Claude Code plans on its opus model, which is the thinking role's "
+            f"{thinking.model.id}; it has no separate place for the plan role's {plan.model.id}."
+        )
+    notes += _unplaced(setup, "Claude Code", ("vision", "compaction"), per_role_effort=False)
+    tier_ids = {setup.default.id, (setup.small or setup.default).id, thinking.model.id}
+    others = [m.id for m in setup.models if m.id not in tier_ids]
     if len(others) > 1:
         notes.append(
             f"The /model picker has room for one extra model, {others[0]}; "
             f"{', '.join(others[1:])} can still be chosen with --model."
         )
+    return notes
+
+
+def _and(items: list[str]) -> str:
+    """A list as it reads in a sentence: a, b and c."""
+    return ", ".join(items[:-1]) + (" and " if len(items) > 1 else "") + items[-1]
+
+
+def _unplaced(
+    setup: Setup, client: str, missing: tuple[str, ...], per_role_effort: bool
+) -> list[str]:
+    """Notes for configured roles, and role efforts, a client has no place for."""
+    notes = []
+    roles = [name for name in missing if (role := setup.role(name)) and role.configured]
+    if roles:
+        notes.append(
+            f"{client} has no setting for the {' or '.join(roles)} "
+            f"role{'s' if len(roles) > 1 else ''}, so "
+            f"{'they are' if len(roles) > 1 else 'it is'} left out."
+        )
+    if not per_role_effort:
+        efforts = [name for name, role in setup.roles.items() if role.configured and role.effort]
+        if efforts:
+            notes.append(
+                f"{client} can't set an effort per role, so the effort given for "
+                f"{_and(efforts)} isn't used: each model's own default applies."
+            )
     return notes
 
 
@@ -399,12 +555,28 @@ def qwen_code(setup: Setup) -> dict[str, Any]:
             "envKey": setup.env_key,
             "generationConfig": generation,
         })
-    return {
+    config: dict[str, Any] = {
         "env": {setup.env_key: setup.api_key},
         "modelProviders": {"openai": providers},
         "security": {"auth": {"selectedType": "openai"}},
         "model": {"name": setup.default.id},
     }
+    # Each is left empty by Qwen Code to mean the main model.
+    for role, key in (
+        ("small", "fastModel"),          # prompt suggestions, speculative execution
+        ("vision", "visionModel"),       # describes images for a text-only model
+        ("compaction", "compactionModel"),
+    ):
+        if chosen := setup.role(role):
+            config[key] = chosen.model.id
+    if subagent := setup.role("subagent"):
+        # Its built-in Explore subagent; custom subagents name their own.
+        config["agents"] = {"builtin": {"exploreModel": subagent.model.id}}
+    return config
+
+
+def _qwen_notes(setup: Setup) -> list[str]:
+    return _unplaced(setup, "Qwen Code", ("thinking", "plan"), per_role_effort=False)
 
 
 # ----------------------------------------------------------------------- Zed
@@ -428,13 +600,15 @@ def zed(setup: Setup) -> dict[str, Any]:
         }
         models.append(entry)
 
-    def pick(model: Model) -> dict[str, str]:
-        return {"provider": setup.provider_id, "model": model.id}
-
-    agent: dict[str, Any] = {"default_model": pick(setup.default)}
-    if setup.small:
-        agent["thread_summary_model"] = pick(setup.small)
-        agent["commit_message_model"] = pick(setup.small)
+    agent: dict[str, Any] = {"default_model": _zed_pick(setup, setup.roles["default"])}
+    for role, keys in (
+        ("small", ("thread_summary_model", "commit_message_model")),
+        ("subagent", ("subagent_model",)),
+        ("compaction", ("compaction_model",)),
+    ):
+        if chosen := setup.role(role):
+            for key in keys:
+                agent[key] = _zed_pick(setup, chosen)
     provider: dict[str, Any] = {"api_url": setup.openai_url, "available_models": models}
     if setup.user_header:
         provider["custom_headers"] = {USER_HEADER: setup.user_header}
@@ -442,6 +616,22 @@ def zed(setup: Setup) -> dict[str, Any]:
         "language_models": {"openai_compatible": {setup.provider_id: provider}},
         "agent": agent,
     }
+
+
+def _zed_effort(role: Role) -> str | None:
+    """The role's effort, if Zed can send it: only for a model it knows thinks,
+    which is one with a reasoning_effort, and only as one of its own levels."""
+    if role.effort in ZED_EFFORTS and role.model.effort in ZED_EFFORTS:
+        return role.effort
+    return None
+
+
+def _zed_pick(setup: Setup, role: Role) -> dict[str, Any]:
+    selection: dict[str, Any] = {"provider": setup.provider_id, "model": role.model.id}
+    if effort := _zed_effort(role):
+        selection["enable_thinking"] = effort != "none"
+        selection["effort"] = effort
+    return selection
 
 
 def _zed_notes(setup: Setup) -> list[str]:
@@ -457,7 +647,14 @@ def _zed_notes(setup: Setup) -> list[str]:
         notes.append(f"Zed has no reasoning_effort {', '.join(odd)}, so it isn't set.")
     if any(m.context is None for m in setup.models):
         notes.append("Zed needs max_tokens for every model; add it where it's missing.")
-    return notes
+    unsent = [name for name, role in setup.roles.items()
+              if role.configured and role.effort and not _zed_effort(role)]
+    if unsent:
+        notes.append(
+            f"Zed only sends an effort for a model with a reasoning_effort it knows, so "
+            f"the effort for {_and(unsent)} isn't used."
+        )
+    return notes + _unplaced(setup, "Zed", ("thinking", "plan", "vision"), per_role_effort=True)
 
 
 # ---------------------------------------------------------------- Oh My Pi
@@ -473,6 +670,7 @@ def _omp_efforts(m: Model) -> list[str]:
 
 
 def oh_my_pi(setup: Setup) -> dict[str, Any]:
+    compaction = setup.role("compaction")
     models = []
     for m in setup.models:
         efforts = _omp_efforts(m)
@@ -505,6 +703,9 @@ def oh_my_pi(setup: Setup) -> dict[str, Any]:
             compat["extraBody"] = extra
         if compat:
             entry["compat"] = compat
+        if compaction and compaction.model is not m:
+            # Summarises this model's sessions when they outgrow its context.
+            entry["compactionModel"] = _omp_selector(setup, compaction)
         models.append(entry)
 
     provider: dict[str, Any] = {
@@ -528,11 +729,35 @@ def oh_my_pi(setup: Setup) -> dict[str, Any]:
     return {"providers": {setup.provider_id: provider}}
 
 
+# The router's roles, as omp's. Its tiny role (titles) and memory role fall
+# back to smol by themselves, but commit has its own list of cloud models first.
+OMP_ROLES = {
+    "default": ("default",),
+    "small": ("smol", "tiny", "commit"),
+    "thinking": ("slow",),
+    "plan": ("plan",),
+    "subagent": ("task",),
+    "vision": ("vision",),
+}
+
+
+def _omp_selector(setup: Setup, role: Role) -> str:
+    """provider/model, with a thinking-level suffix where omp has that level."""
+    return role.selector(setup.provider_id, lambda e: e if e in _omp_efforts(role.model) else None)
+
+
 def oh_my_pi_roles(setup: Setup) -> dict[str, Any]:
-    """The ~/.omp/agent/config.yml half: models.yml can't choose a default."""
-    roles = {"default": f"{setup.provider_id}/{setup.default.id}"}
-    if setup.small:
-        roles["smol"] = roles["tiny"] = roles["commit"] = f"{setup.provider_id}/{setup.small.id}"
+    """The ~/.omp/agent/config.yml half: models.yml can't assign roles.
+
+    Every resolved role is written out, fallbacks included. omp's own fallback
+    for an unset role is a list of cloud models, which it would reach for first
+    whenever one of them is logged in.
+    """
+    roles: dict[str, str] = {}
+    for ours, theirs in OMP_ROLES.items():
+        if role := setup.role(ours):
+            for name in theirs:
+                roles[name] = _omp_selector(setup, role)
     return {"modelRoles": roles}
 
 
@@ -556,8 +781,15 @@ def _omp_notes(setup: Setup) -> list[str]:
         )
     if (setup.small is None and len(setup.models) > 1):
         notes.append(
-            "Set clients.small_model in the router's config to give Oh My Pi a model for "
+            "Set clients.roles.small in the router's config to give Oh My Pi a model for "
             "its background work (titles, commit messages)."
+        )
+    unsent = sorted(name for name, role in setup.roles.items()
+                    if role.configured and role.effort and role.effort not in _omp_efforts(role.model))
+    if unsent:
+        notes.append(
+            f"Oh My Pi has no thinking level for the effort given for {_and(unsent)}, "
+            "so it starts those at the model's own default."
         )
     return notes
 
@@ -603,7 +835,7 @@ def _opencode_steps(setup: Setup, url: str) -> list[dict[str, str]]:
 
 
 def _claude_steps(setup: Setup, url: str) -> list[dict[str, str]]:
-    shell = url + ("&" if "?" in url else "?") + "format=shell"
+    shell = _with_query(url, "format=shell")
     return [
         {"text": "Try it without changing any files:",
          "command": f"claude --settings \"$(curl -s '{url}')\""},
@@ -616,7 +848,7 @@ def _claude_steps(setup: Setup, url: str) -> list[dict[str, str]]:
 def _qwen_steps(setup: Setup, url: str) -> list[dict[str, str]]:
     return [
         {"text": "Save it as ~/.qwen/settings.json if you have none; otherwise merge in its "
-                 "env, modelProviders, security and model keys.",
+                 "top-level keys.",
          "command": f"curl -s '{url}' -o ~/.qwen/settings.json"},
     ]
 
@@ -636,10 +868,14 @@ def _omp_steps(setup: Setup, url: str) -> list[dict[str, str]]:
         {"text": "Save it as ~/.omp/agent/models.yml if you have none; otherwise add its "
                  f"{setup.provider_id} provider to yours. omp models lists what it loaded.",
          "command": f"curl -s --create-dirs '{url}' -o ~/.omp/agent/models.yml"},
-        {"text": "Then make it the default in ~/.omp/agent/config.yml, or pick a model with "
-                 f"/model or --model {setup.provider_id}/{setup.default.id}:",
+        {"text": "Then give its models their roles, in ~/.omp/agent/config.yml. These are "
+                 f"also at {_with_query(url, 'format=config')}:",
          "command": _yaml(oh_my_pi_roles(setup)).rstrip("\n")},
     ]
+
+
+def _with_query(url: str, query: str) -> str:
+    return url + ("&" if "?" in url else "?") + query
 
 
 CLIENTS: dict[str, Client] = {
@@ -652,7 +888,7 @@ CLIENTS: dict[str, Client] = {
         Client("claude-code", "Claude Code", "~/.claude/settings.json", "settings.json",
                lambda s: _json(claude_code(s)), _claude_steps, _claude_notes),
         Client("qwen-code", "Qwen Code", "~/.qwen/settings.json", "settings.json",
-               lambda s: _json(qwen_code(s)), _qwen_steps, lambda s: []),
+               lambda s: _json(qwen_code(s)), _qwen_steps, _qwen_notes),
         Client("zed", "Zed", "~/.config/zed/settings.json", "settings.json",
                lambda s: _json(zed(s)), _zed_steps, _zed_notes),
         Client("oh-my-pi", "Oh My Pi", "~/.omp/agent/models.yml", "models.yml",
@@ -688,6 +924,11 @@ def routes(router: Router) -> list[Route]:
             "api_key_env": setup.env_key,
             "default_model": setup.default.id,
             "small_model": setup.small.id if setup.small else None,
+            "roles": {
+                name: {"model": role.model.id, "effort": role.effort,
+                       "configured": role.configured}
+                for name, role in setup.roles.items()
+            },
             "user": setup.user,
             # For clients configured from this document rather than a generated
             # file: how long a request may wait for its response to start
@@ -727,8 +968,12 @@ def routes(router: Router) -> list[Route]:
         setup = setup_or_error(request)
         if isinstance(setup, Response):
             return setup
-        if client.id == "claude-code" and request.query_params.get("format") == "shell":
+        fmt = request.query_params.get("format")
+        if client.id == "claude-code" and fmt == "shell":
             return Response(claude_code_shell(setup), media_type="text/plain; charset=utf-8",
+                            headers={"cache-control": "no-store"})
+        if client.id == "oh-my-pi" and fmt == "config":
+            return Response(_yaml(oh_my_pi_roles(setup)), media_type=client.media_type,
                             headers={"cache-control": "no-store"})
         return Response(client.render(setup), media_type=client.media_type,
                         headers={"cache-control": "no-store"})
