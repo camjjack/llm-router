@@ -143,6 +143,18 @@ backends:
     capacity: 256
     models: [qwen3.6-27b]
 
+  # --- TensorFold ------------------------------------------------------------
+  # capacity must equal --parallel: a request past it waits inside TensorFold,
+  # out of the router's sight. The router warns if /health says otherwise, and
+  # cross-checks its in-flight count against /health's requests_running.
+  # Context comes from /tokenize's max_model_len where the deployment adds it;
+  # plain TensorFold has none, so set context_length then. OpenAI surface only.
+  # - name: sparks-tf
+  #   url: http://10.0.0.50:8888
+  #   kind: tensorfold
+  #   capacity: 4
+  #   models: [GLM-5.3-Flash-EXL3]
+
   # --- LM Studio ------------------------------------------------------------
   # capacity must match the parallel-request setting in LM Studio's server UI.
   # LM Studio has no /health, so the router uses /api/v0/models for liveness.

@@ -393,6 +393,31 @@ async def test_a_stream_that_breaks_mid_flight_says_what_broke():
         assert router.scheduler.backends["a"].inflight == 0
 
 
+async def test_an_error_inside_a_stream_counts_as_an_error():
+    """The 200 went out first, so the backend reports the failure in the stream.
+
+    It reaches the client unchanged, and counts against the request, not the
+    host: the backend answered, so it stays up.
+    """
+    upstream = FakeUpstream(name="a", max_concurrency=1, model=MODEL, latency_s=0.05,
+                            chunks=2, stream_error="context_length_exceeded")
+    async with router_stack([upstream]) as (client, router):
+        r = await client.post("/v1/chat/completions", json=turn(1, stream=True))
+        assert r.status_code == 200
+        assert '"error": {"message": "context_length_exceeded"' in r.text
+
+        for _ in range(100):
+            if router.tracker.snapshot()["recent"]:
+                break
+            await asyncio.sleep(0.05)
+        [ended] = router.tracker.snapshot()["recent"]
+        assert ended["state"] == "error"
+        assert ended["note"] == "stream error: context_length_exceeded"
+        stats = router.stats.backend("a")
+        assert (stats.errors, stats.completed) == (1, 0)
+        assert router.scheduler.backends["a"].healthy is True
+
+
 # -------------------------------------------------------------------- failover
 
 

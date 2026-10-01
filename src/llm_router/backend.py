@@ -51,9 +51,13 @@ class BackendClients:
         # tasks are not garbage-collected mid-flight).
         self._retired: set[Upstream] = set()
         self._closing: set[asyncio.Task] = set()
-        # Real slot occupancy from llama.cpp's /slots, when it is available. Used to
-        # spot drift between what we think is running and what actually is.
+        # Real slot occupancy from llama.cpp's /slots, vLLM's /load or TensorFold's
+        # /health, when available. Used to spot drift between what we think is
+        # running and what actually is.
         self.observed_busy: dict[str, int | None] = {b.name: None for b in config.backends}
+        # The stream count a capacity warning was last given for, so a probe every
+        # few seconds says it once rather than every time.
+        self._warned_capacity: dict[str, int] = {}
         # Usable context per backend, from config or discovered upstream.
         self.context_length: dict[str, int | None] = {
             b.name: b.context_length for b in config.backends
@@ -289,6 +293,10 @@ class BackendClients:
             value = await self._context_from_lmstudio(backend, timeout)
             if value is None:
                 value = await self._context_from_models(backend, timeout)
+        elif backend.kind == "tensorfold":
+            value = await self._context_from_tokenize(backend, timeout)
+            if value is None:
+                value = await self._context_from_models(backend, timeout)
         elif backend.kind == "llamacpp":
             value = await self._context_from_props(backend, timeout)
             if value is None:
@@ -325,6 +333,29 @@ class BackendClients:
             return None
         with self.lend(backend.name) as client:
             return await client.get(path, headers=self.headers_for(backend), timeout=timeout)
+
+    async def _context_from_tokenize(
+        self, backend: BackendConfig, timeout: float
+    ) -> int | None:
+        """TensorFold: /tokenize -> max_model_len, the window it was started with.
+
+        Its /v1/models lists ids and nothing else. /tokenize is vLLM's, added by
+        some TensorFold deployments; plain v0.6.0 has none, and 404s.
+        """
+        if backend.name not in self._upstreams:
+            return None
+        try:
+            with self.lend(backend.name) as client:
+                response = await client.post(
+                    "/tokenize", json={"prompt": ""},
+                    headers=self.headers_for(backend), timeout=timeout,
+                )
+            if response.status_code != 200:
+                return None
+            value = (response.json() or {}).get("max_model_len")
+            return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
+            return None
 
     async def _context_from_props(
         self, backend: BackendConfig, timeout: float
@@ -423,7 +454,7 @@ class BackendClients:
     ) -> None:
         """Ask a backend what *it* thinks it is running, and compare with our count.
 
-        Only llama.cpp (/slots) and vLLM (/load) publish this. A backend reporting
+        Only llama.cpp (/slots), vLLM (/load) and TensorFold (/health) publish this. A backend reporting
         more work than we dispatched means something else is sharing the host, which
         silently invalidates our capacity gate -- worth saying out loud.
         """
@@ -474,6 +505,28 @@ class BackendClients:
             return sum(
                 1 for s in payload if isinstance(s, dict) and s.get("is_processing")
             )
+
+        if backend.kind == "tensorfold":
+            # /health: requests_running counts requests holding a stream, not the
+            # ones waiting for one. streams.max is --parallel, where the deployment
+            # decodes several at once.
+            if not isinstance(payload, dict):
+                return None
+            streams = payload.get("streams")
+            most = streams.get("max") if isinstance(streams, dict) else None
+            if isinstance(most, int) and not isinstance(most, bool) and 0 < most < backend.capacity:
+                if self._warned_capacity.get(backend.name) != most:
+                    self._warned_capacity[backend.name] = most
+                    log.warning(
+                        "backend %s decodes %d requests at once but is configured with "
+                        "capacity %d; lower capacity to match its --parallel, or the rest "
+                        "wait inside TensorFold where the router can't see them",
+                        backend.name, most, backend.capacity,
+                    )
+            value = payload.get("requests_running")
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value
 
         if backend.kind == "vllm":
             # {"server_load": N} -- requests currently occupying the GPU.

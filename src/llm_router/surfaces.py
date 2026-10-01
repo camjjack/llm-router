@@ -214,8 +214,34 @@ ANTHROPIC = AnthropicSurface()
 MAX_SSE_LINE_BYTES = 1 << 20
 
 
+# What a stream event has to contain to be worth parsing: usage, or an error.
+# Inside generated text the quotes around a word are escaped, so neither marker
+# turns up there -- only as a key.
+_MARKERS = (b'"usage"', b'"error"')
+MAX_ERROR_CHARS = 200
+
+
+def stream_error(event: Any) -> str | None:
+    """What went wrong, if this stream event reports a failure.
+
+    Once a stream's 200 has gone out, a backend can only say it failed in the
+    stream itself: OpenAI-style servers (TensorFold, vLLM) send an event with a
+    top-level "error", Anthropic's surface an `error` event, whose data has one
+    too. Never part of a normal chunk, whichever surface.
+    """
+    if not isinstance(event, dict) or "error" not in event:
+        return None
+    error = event["error"]
+    if isinstance(error, dict):
+        text = error.get("message") or error.get("type") or error.get("code")
+    else:
+        text = error
+    return str(text or "error")[:MAX_ERROR_CHARS]
+
+
 class StreamTap:
-    """Observes a pass-through SSE stream to recover its token usage.
+    """Observes a pass-through SSE stream to recover its token usage, and any
+    error it reports.
 
     The bytes are forwarded untouched -- this only watches them go by, so the
     client receives exactly what the backend sent. Usage is *merged* rather than
@@ -228,6 +254,8 @@ class StreamTap:
         self._buffer = b""
         self._merged: dict = {}
         self.chunks = 0
+        # The first error the stream reported, if it reported one.
+        self.error: str | None = None
 
     @property
     def usage(self) -> TokenUsage | None:
@@ -235,7 +263,7 @@ class StreamTap:
 
     def feed(self, chunk: bytes) -> None:
         self.chunks += 1
-        if b"usage" not in chunk and b"usage" not in self._buffer:
+        if not any(m in chunk or m in self._buffer for m in _MARKERS):
             # Fast path: keep a short tail in case a line straddles chunks.
             self._buffer = (self._buffer + chunk)[-256:]
             return
@@ -248,7 +276,7 @@ class StreamTap:
         self._buffer = lines.pop()
         for line in lines:
             line = line.strip()
-            if not line.startswith(b"data:") or b'"usage"' not in line:
+            if not line.startswith(b"data:") or not any(m in line for m in _MARKERS):
                 continue
             payload = line[5:].strip()
             if payload in (b"", b"[DONE]"):
@@ -257,6 +285,8 @@ class StreamTap:
                 event = json.loads(payload)
             except ValueError:
                 continue
+            if self.error is None:
+                self.error = stream_error(event)
             usage = self._surface.usage_from_event(event)
             if isinstance(usage, dict):
                 self._merged.update(usage)

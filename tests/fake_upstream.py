@@ -67,6 +67,12 @@ class FakeUpstream:
     load_tracking: bool = True
     # Simulate llama.cpp started with --no-props, forcing the fallback path.
     props_available: bool = True
+    # TensorFold only: /tokenize exists (a deployment's patch; plain v0.6.0 has
+    # none), and the --parallel its /health reports (None: no streams section).
+    tokenize_available: bool = True
+    parallel: int | None = None
+    # Requests running that some other client sent, not the router.
+    foreign_running: int = 0
 
     active: int = 0
     outstanding: int = 0
@@ -84,6 +90,9 @@ class FakeUpstream:
     # Drop the connection after this many streamed chunks, as a backend that dies
     # (or a read timeout) does: the client already has a 200 and some bytes.
     abort_after: int | None = None
+    # End streams with this error event in place of the final chunk, as TensorFold
+    # does when a request fails after its 200 has gone out.
+    stream_error: str | None = None
     # Report cached-token counts in usage at all. vLLM omits them entirely unless
     # started with --enable-prompt-tokens-details, and that silence must not be
     # read as "nothing was cached".
@@ -107,6 +116,7 @@ class FakeUpstream:
                 Route("/slots", self._slots, methods=["GET"]),
                 Route("/load", self._load, methods=["GET"]),
                 Route("/v1/models", self._models, methods=["GET"]),
+                Route("/tokenize", self._tokenize, methods=["POST"]),
                 Route("/api/v0/models", self._lmstudio_models, methods=["GET"]),
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
                 Route("/v1/messages", self._messages, methods=["POST"]),
@@ -145,7 +155,22 @@ class FakeUpstream:
             return JSONResponse({"error": "not found"}, status_code=404)
         if not self.healthy:
             return JSONResponse({"status": "unavailable"}, status_code=503)
+        if self.kind == "tensorfold":
+            running = self.active + self.foreign_running
+            body: dict = {"ok": True, "backend": "tensorfold", "busy": running > 0,
+                          "requests_running": running, "requests_total": self.total_requests}
+            if self.parallel is not None:
+                body["streams"] = {"max": self.parallel, "decoding": running, "filling": 0}
+            return JSONResponse(body)
         return JSONResponse({"status": "ok"})
+
+    async def _tokenize(self, request: Request) -> JSONResponse:
+        if self.kind != "tensorfold" or not self.tokenize_available:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        body = await request.json()
+        tokens = list(range(len(str(body.get("prompt", "")).split())))
+        return JSONResponse({"count": len(tokens), "max_model_len": self.context_length,
+                             "tokens": tokens})
 
     async def _props(self, request: Request) -> JSONResponse:
         if self.kind != "llamacpp" or not self.props_available:
@@ -200,8 +225,8 @@ class FakeUpstream:
         if self.kind == "llamacpp":
             # Note: n_ctx_train, NOT the served context. Reading this is the bug.
             entry["meta"] = {"n_ctx_train": self.n_ctx_train}
-        elif self.kind == "lmstudio":
-            # LM Studio's OpenAI surface carries no context information at all.
+        elif self.kind in ("lmstudio", "tensorfold"):
+            # Neither's OpenAI surface carries context information at all.
             pass
         elif self.context_length is not None:
             entry["max_model_len"] = self.context_length
@@ -421,6 +446,11 @@ class FakeUpstream:
                     "choices": [{"index": 0, "delta": {"content": f"t{i}"}}],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n".encode()
+            if self.stream_error is not None:
+                # TensorFold's _stream_error: an error event, then [DONE].
+                error = {"error": {"message": self.stream_error, "type": "server_error"}}
+                yield f"data: {json.dumps(error)}\n\ndata: [DONE]\n\n".encode()
+                return
             final = {
                 "id": "chatcmpl-fake",
                 "object": "chat.completion.chunk",

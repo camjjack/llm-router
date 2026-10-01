@@ -788,6 +788,14 @@ class Router:
             await upstream.aclose()
             lease.release()
 
+            # A stream can fail without breaking: the backend says so in the
+            # stream itself and ends it normally, its 200 long since sent. The
+            # backend is fine -- it answered -- so this is the request's failure,
+            # not the host's, and nothing is marked down.
+            if tap.error is not None and not failed:
+                failed = True
+                tracked.note = f"stream error: {tap.error}"
+                log.warning("backend %s reported an error mid-stream: %s", name, tap.error)
             if failed:
                 bstats.errors += 1
             else:
