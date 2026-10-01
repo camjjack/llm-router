@@ -15,7 +15,7 @@ from .tracking import DEFAULT_USER_HEADERS
 
 # Backend engines we know how to probe. They differ in where they publish context
 # length and load, and in whether they want to be saturated -- see BackendConfig.
-KINDS = ("ninfer", "llamacpp", "vllm", "lmstudio", "openai")
+KINDS = ("ninfer", "llamacpp", "vllm", "lmstudio", "tensorfold", "openai")
 
 # ninfer caps --max-concurrency at 8, llama.cpp slots are bounded by -np, LM Studio
 # by its parallel-requests setting. vLLM's --max-num-seqs defaults to 256, so it is
@@ -68,6 +68,8 @@ class BackendConfig:
             return "/slots"  # on unless --no-slots
         if self.kind == "vllm":
             return "/load"  # requires --enable-server-load-tracking
+        if self.kind == "tensorfold":
+            return "/health"  # requests_running, beside the liveness fields
         return None
 
     @property

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 
 import httpx
@@ -219,3 +220,37 @@ async def test_mixed_engine_pool_advertises_the_smallest():
         assert by_name["ninfer"]["context_length"] == 65536
         assert by_name["vllm"]["context_length"] == 131072
         assert by_name["lms"]["context_length"] == 8192
+
+
+async def test_tensorfold_context_from_tokenize():
+    """Its /v1/models lists ids only; /tokenize reports the window it serves."""
+    upstream = FakeUpstream(name="t", model="m", kind="tensorfold", context_length=1048576,
+                            max_concurrency=4)
+    async with stack([upstream]) as (client, router):
+        assert router.clients.context_length["t"] == 1048576
+        entry = (await client.get("/v1/models")).json()["data"][0]
+        assert entry["max_model_len"] == 1048576
+
+
+async def test_tensorfold_without_tokenize_leaves_the_context_unknown():
+    """Plain TensorFold v0.6.0 has no /tokenize: unknown, not guessed."""
+    upstream = FakeUpstream(name="t", model="m", kind="tensorfold", context_length=1048576,
+                            tokenize_available=False)
+    await upstream.start()
+    config = Config(
+        backends=(BackendConfig(name="t", url=upstream.url, capacity=2, models=("m",),
+                                kind="tensorfold"),),
+        health=HealthConfig(interval_s=0.2, timeout_s=2),
+    )
+    router = Router(config)
+    try:
+        async with running_app(create_app(config, router)):
+            for _ in range(20):
+                if router.scheduler.backends["t"].healthy:
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.3)
+            assert router.scheduler.backends["t"].healthy is True
+            assert router.context_for("m") is None
+    finally:
+        await upstream.stop()

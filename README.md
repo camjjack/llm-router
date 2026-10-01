@@ -9,8 +9,8 @@ A load-balancing proxy for local LLM backends that does two things ordinary rout
    so staying put turns a full prefill into a prompt-cache hit.
 
 Speaks both the **OpenAI chat-completions** API and the **Anthropic Messages** API, so opencode and
-Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.cpp**, **vLLM** and
-**LM Studio** backends, including a mix of engines serving the same model.
+Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.cpp**, **vLLM**,
+**LM Studio** and **TensorFold** backends, including a mix of engines serving the same model.
 
 | Endpoint | For |
 |---|---|
@@ -27,10 +27,12 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 | `llamacpp` | `/health` | `/slots` | `/props` `n_ctx` (per slot) | `-np` / `--parallel` |
 | `vllm` | `/health` | `/load` † | `/v1/models` `max_model_len` | `--max-num-seqs` |
 | `lmstudio` | `/api/v0/models` ‡ | none | `/api/v0/models` `loaded_context_length` | parallel-requests setting |
+| `tensorfold` | `/health` | `/health` `requests_running` | `/tokenize` `max_model_len` § | `--parallel` |
 | `openai` | `/health` | none | `/v1/models` | whatever the endpoint allows |
 
 † needs `--enable-server-load-tracking`; absent is handled gracefully.
 ‡ LM Studio has no `/health` endpoint, so its model list stands in.
+§ `/tokenize` is added by some deployments, not TensorFold itself; without it, set `context_length`.
 
 ## Why not least-busy routing
 
@@ -558,6 +560,28 @@ that keep the field null regardless.
 default, in which case use `1`). Newer builds want an auth token; set `api_key: "${LM_API_TOKEN}"`.
 Note that LM Studio's context is whatever you allocated when *loading* the model, not the model's
 maximum — load a 128k model with an 8k context and 8k is what you get.
+
+**TensorFold** — `capacity` must equal `--parallel` (`PARALLEL` in the dual-Spark recipe). A request
+past it doesn't fail: it waits inside TensorFold, where the router can't see it or send it elsewhere.
+With `kind: tensorfold` the router reads `/health`'s `streams.max` and warns if `capacity` is higher,
+and cross-checks its in-flight count against `requests_running`. TensorFold's `/v1/models` lists ids
+only, so the context comes from `/tokenize`, where the deployment has it (the dual-Spark recipe does);
+otherwise set `context_length` on the backend.
+
+```yaml
+  - name: sparks-tf
+    url: http://<head>:8888
+    kind: tensorfold
+    capacity: 4
+    models: [GLM-5.3-Flash-EXL3]
+```
+
+It serves only the OpenAI surface: there is no `/v1/messages`, so Claude Code can't use it. It also
+sends nothing while it reads a prompt, after a first empty chunk, and the router allows
+`timeouts.first_byte_s` (600s by default) of silence: at its ~1,000-2,000 tokens a second, prompts of
+much over half a million tokens need that raised. A request that fails after its stream has begun is
+reported as an error event inside the stream; the router passes it on and counts the request as an
+error, as it does for any backend that does this.
 
 ## Reading the terminal dashboard
 

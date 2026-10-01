@@ -8,6 +8,7 @@ affinity, which is the one thing the cache column exists to tell you about.
 from __future__ import annotations
 
 import contextlib
+import json
 
 import httpx
 from conftest import running_app
@@ -16,7 +17,7 @@ from fake_upstream import FakeUpstream
 from llm_router.config import BackendConfig, Config, HealthConfig
 from llm_router.proxy import Router, create_app
 from llm_router.stats import BackendStats, TokenUsage
-from llm_router.surfaces import ANTHROPIC, OPENAI
+from llm_router.surfaces import ANTHROPIC, OPENAI, StreamTap
 
 MODEL = "test-model"
 
@@ -173,3 +174,44 @@ async def test_backend_reporting_cache_still_shows_a_rate():
 
         entry = router.snapshot()["backends"][0]
         assert entry["cache_hit_rate"] > 0
+
+
+# ----------------------------------------------------------- errors in streams
+
+
+def _sse(*events: dict) -> bytes:
+    return b"".join(f"data: {json.dumps(e)}\n\n".encode() for e in events) + b"data: [DONE]\n\n"
+
+
+def test_an_error_event_is_caught():
+    """TensorFold, like vLLM, ends a failed stream with an error event and [DONE]."""
+    tap = StreamTap(OPENAI)
+    tap.feed(_sse({"choices": [{"delta": {"content": "hi"}}]},
+                  {"error": {"message": "prompt too long", "type": "invalid_request_error"}}))
+    assert tap.error == "prompt too long"
+
+
+def test_an_anthropic_error_event_is_caught():
+    tap = StreamTap(ANTHROPIC)
+    tap.feed(b'event: error\ndata: {"type": "error", "error": {"type": "overloaded_error", '
+             b'"message": "Overloaded"}}\n\n')
+    assert tap.error == "Overloaded"
+
+
+def test_an_error_split_across_chunks_is_still_caught():
+    raw = _sse({"error": {"message": "engine fault"}})
+    tap = StreamTap(OPENAI)
+    for i in range(0, len(raw), 7):
+        tap.feed(raw[i:i + 7])
+    assert tap.error == "engine fault"
+
+
+def test_the_word_error_in_a_reply_is_not_an_error():
+    """Inside generated text its quotes are escaped, so only a key matches."""
+    tap = StreamTap(OPENAI)
+    tap.feed(_sse({"choices": [{"delta": {"content": 'raise "error" here'}}]},
+                  {"choices": [{"delta": {"tool_calls": [{"function": {
+                      "arguments": '{"error": "not a real one"}'}}]}}]},
+                  {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
+    assert tap.error is None
+    assert tap.usage.completion_tokens == 2

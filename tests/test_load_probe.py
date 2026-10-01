@@ -106,3 +106,24 @@ async def test_llamacpp_slot_count_mismatch_is_reported(caplog):
     finally:
         await clients.aclose()
         await upstream.stop()
+
+
+async def test_tensorfold_requests_running_is_read():
+    """/health counts requests holding a stream, the router's and anyone else's."""
+    upstream = FakeUpstream(name="t", model="m", kind="tensorfold", max_concurrency=4,
+                            context_length=1048576, parallel=4)
+    upstream.active = 1
+    upstream.foreign_running = 2
+    async with probed(upstream) as (clients, scheduler):
+        assert clients.observed_busy["t"] == 3
+        assert scheduler.backends["t"].healthy is True
+
+
+async def test_tensorfold_capacity_above_its_parallel_is_warned_about_once(caplog):
+    upstream = FakeUpstream(name="t", model="m", kind="tensorfold", max_concurrency=4,
+                            context_length=1048576, parallel=2)
+    with caplog.at_level("WARNING"):
+        async with probed(upstream):
+            pass
+    warnings = [r for r in caplog.records if "decodes 2 requests at once" in r.getMessage()]
+    assert len(warnings) == 1
