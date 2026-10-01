@@ -19,7 +19,7 @@ from fake_upstream import FakeUpstream
 from starlette.requests import Request
 
 from llm_router import clients
-from llm_router.config import ConfigError, parse_config
+from llm_router.config import ConfigError, RoleConfig, parse_config
 from llm_router.proxy import Router, create_app
 
 GLM = "GLM-5.3-Flash-EXL3"
@@ -228,7 +228,11 @@ def test_oh_my_pi_models_yml():
             }
         }
     }
-    assert clients.oh_my_pi_roles(setup()) == {"modelRoles": {"default": f"glm53/{GLM}"}}
+    # thinking and plan are written out even when they only fall back to the
+    # default: omp's own fallback for them is a list of cloud models.
+    assert clients.oh_my_pi_roles(setup()) == {"modelRoles": {
+        "default": f"glm53/{GLM}", "slow": f"glm53/{GLM}", "plan": f"glm53/{GLM}",
+    }}
     # What is served is YAML, which is what omp reads from models.yml.
     assert yaml.safe_load(clients.CLIENTS["oh-my-pi"].render(setup())) == config
 
@@ -343,6 +347,168 @@ def test_unconfigured_models_still_get_sensible_entries():
                             "limit": {"context": 32768, "output": 32000}}
 
 
+# -------------------------------------------------------------------- roles
+
+# One model for each job, and each client given them in its own terms.
+ROLES_CONFIG = """
+backends:
+  - {name: big, url: 'http://10.0.0.2:8000', kind: vllm, capacity: 4, models: [coder, thinker, mini, eyes]}
+models:
+  coder: {name: Coder, reasoning: true, context_length: 131072, max_output_tokens: 16384,
+          reasoning_efforts: [low, high], request_params: {reasoning_effort: low}}
+  thinker: {name: Thinker, reasoning: true, context_length: 65536, max_output_tokens: 32768,
+            request_params: {reasoning_effort: medium}}
+  mini: {name: Mini, context_length: 32768}
+  eyes: {name: Eyes, images: true, context_length: 32768}
+clients:
+  base_url: http://router:8080
+  roles:
+    default: coder
+    small: mini
+    thinking: {model: thinker, effort: max}
+    subagent: {model: coder, effort: high}
+    vision: eyes
+    compaction: coder
+"""
+
+
+def roles_setup(query: bytes = b"") -> clients.Setup:
+    return setup(ROLES_CONFIG, query=query, discovered={})
+
+
+def test_roles_fall_back_and_add_their_efforts():
+    s = roles_setup()
+    summary = {name: (r.model.id, r.effort, r.configured) for name, r in s.roles.items()}
+    assert summary == {
+        "default": ("coder", None, True),
+        "small": ("mini", None, True),
+        "thinking": ("thinker", "max", True),
+        # Unset, so it follows thinking.
+        "plan": ("thinker", "max", False),
+        "subagent": ("coder", "high", True),
+        "vision": ("eyes", None, True),
+        "compaction": ("coder", None, True),
+    }
+    # A role's effort becomes one its model can be switched to.
+    by_id = {m.id: m for m in s.models}
+    assert "max" in by_id["thinker"].efforts
+    assert s.warnings == []
+
+
+def test_asking_for_another_default_drops_the_configured_effort():
+    text = ROLES_CONFIG.replace("    default: coder", "    default: {model: coder, effort: high}")
+    s = setup(text, discovered={})
+    assert (s.default.id, s.roles["default"].effort) == ("coder", "high")
+    s = setup(text, query=b"model=thinker", discovered={})
+    assert (s.default.id, s.roles["default"].effort) == ("thinker", None)
+
+
+def test_opencode_gets_roles_as_agents():
+    config = clients.opencode(roles_setup())
+    assert config["model"] == "llm-router/coder"
+    assert config["small_model"] == "llm-router/mini"
+    assert config["agent"] == {
+        # The model's own default effort has to be asked for as a variant.
+        "build": {"model": "llm-router/coder", "variant": "low"},
+        "plan": {"model": "llm-router/thinker", "variant": "max"},
+        "general": {"model": "llm-router/coder", "variant": "high"},
+        "explore": {"model": "llm-router/coder", "variant": "high"},
+        "compaction": {"model": "llm-router/coder", "variant": "low"},
+    }
+    variants = config["provider"]["llm-router"]["models"]["thinker"]["variants"]
+    assert set(variants) == {"medium", "max"}
+
+
+def test_claude_code_gets_roles_as_tiers():
+    s = roles_setup()
+    env = clients.claude_code(s)["env"]
+    assert env["ANTHROPIC_DEFAULT_MODEL"] == "coder"
+    assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "coder"
+    # opus is also what opusplan plans with.
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "thinker"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "mini"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "coder"
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "eyes"
+    # One limit for every model a conversation can be on: the smallest.
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "16384"
+    notes = " ".join(clients.CLIENTS["claude-code"].notes(s))
+    assert "vision or compaction roles" in notes
+    assert "effort given for thinking and subagent isn't used" in notes
+
+
+def test_claude_code_leaves_subagents_alone_without_a_subagent_role():
+    env = clients.claude_code(setup())["env"]
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+
+
+def test_qwen_code_gets_its_role_settings():
+    s = roles_setup()
+    config = clients.qwen_code(s)
+    assert (config["model"], config["fastModel"]) == ({"name": "coder"}, "mini")
+    assert (config["visionModel"], config["compactionModel"]) == ("eyes", "coder")
+    assert config["agents"] == {"builtin": {"exploreModel": "coder"}}
+    notes = " ".join(clients.CLIENTS["qwen-code"].notes(s))
+    # plan was never set, so only thinking is missing.
+    assert "no setting for the thinking role" in notes
+
+
+def test_zed_gets_roles_with_their_effort():
+    agent = clients.zed(roles_setup())["agent"]
+    assert agent["default_model"] == {"provider": "llm-router", "model": "coder"}
+    assert agent["thread_summary_model"] == agent["commit_message_model"] == {
+        "provider": "llm-router", "model": "mini"}
+    assert agent["subagent_model"] == {"provider": "llm-router", "model": "coder",
+                                       "enable_thinking": True, "effort": "high"}
+    assert agent["compaction_model"] == {"provider": "llm-router", "model": "coder"}
+
+
+def test_oh_my_pi_gets_every_role():
+    s = roles_setup()
+    assert clients.oh_my_pi_roles(s) == {"modelRoles": {
+        "default": "llm-router/coder",
+        "smol": "llm-router/mini", "tiny": "llm-router/mini", "commit": "llm-router/mini",
+        "slow": "llm-router/thinker:max",
+        "plan": "llm-router/thinker:max",
+        "task": "llm-router/coder:high",
+        "vision": "llm-router/eyes",
+    }}
+    models = {m["id"]: m for m in clients.oh_my_pi(s)["providers"]["llm-router"]["models"]}
+    # Compaction is set per model, on every model but the one doing it.
+    assert "compactionModel" not in models["coder"]
+    assert {models[m]["compactionModel"] for m in ("thinker", "mini", "eyes")} == {"llm-router/coder"}
+    assert models["thinker"]["thinking"]["efforts"] == ["medium", "max"]
+
+
+def test_suspicious_roles_are_warned_about():
+    text = ROLES_CONFIG.replace("    vision: eyes", "    vision: mini").replace(
+        "    compaction: coder", "    compaction: thinker")
+    warnings = " ".join(setup(text, discovered={}).warnings)
+    assert "vision is mini, which isn't marked as taking images" in warnings
+    assert "compaction is thinker, with a smaller context" in warnings
+
+
+def test_roles_config():
+    base = "backends:\n  - {name: a, url: 'http://x', capacity: 1, models: [m, n]}\n"
+    roles = parse_config(base + "clients: {roles: {default: m, thinking: {model: n, effort: max}}}\n")
+    assert roles.clients.roles["thinking"] == RoleConfig("n", "max")
+    # The shorthands from before roles still work, and still read back.
+    legacy = parse_config(base + "clients: {default_model: n, small_model: m}\n").clients
+    assert legacy.roles == {"default": RoleConfig("n"), "small": RoleConfig("m")}
+    assert (legacy.default_model, legacy.small_model) == ("n", "m")
+    for bad in (
+        "clients: {roles: [m]}",
+        "clients: {roles: {fastest: m}}",
+        "clients: {roles: {default: typo}}",
+        "clients: {roles: {default: {model: m, speed: 11}}}",
+        "clients: {roles: {default: {effort: high}}}",
+        "clients: {roles: {default: {model: m, effort: ''}}}",
+        "clients: {roles: {default: m}, default_model: n}",
+    ):
+        with pytest.raises(ConfigError):
+            parse_config(base + bad + "\n")
+
+
 # ------------------------------------------------------------------- config
 
 
@@ -405,6 +571,9 @@ async def test_endpoints():
 
         raw = await client.get("/clients/zed")
         assert raw.headers["content-type"].startswith("application/json")
+        roles = await client.get("/clients/oh-my-pi", params={"format": "config"})
+        assert yaml.safe_load(roles.text)["modelRoles"]["default"] == "llm-router/m"
+        assert index["roles"]["default"] == {"model": "m", "effort": None, "configured": False}
         omp = await client.get("/clients/oh-my-pi")
         assert omp.headers["content-type"].startswith("application/yaml")
         assert yaml.safe_load(omp.text)["providers"]["llm-router"]["models"][0]["id"] == "m"

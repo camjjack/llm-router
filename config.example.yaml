@@ -53,7 +53,14 @@ health:
 # clients:
 #   provider_id: llm-router
 #   provider_name: llm-router
-#   default_model: qwen3.6-27b
+#   roles:                         # which model each client uses for what
+#     default: qwen3.6-27b         # default: the first model
+#     small: qwen3-4b              # titles, summaries, commit messages
+#     thinking: {model: qwen3.6-27b, effort: high}   # unset: default
+#     plan: qwen3.6-27b            # unset: thinking
+#     subagent: {model: qwen3.6-27b, effort: low}
+#     vision: qwen3-vl-8b          # reading images, for a text-only default
+#     compaction: qwen3.6-27b      # summarising a conversation that outgrew its context
 #   base_url: http://10.0.0.1:8080  # default: the address the config was fetched from
 
 # Per-user session tracking, shown at http://<router>/dashboard. Users are named
