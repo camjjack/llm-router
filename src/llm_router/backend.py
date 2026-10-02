@@ -51,12 +51,12 @@ class BackendClients:
         # tasks are not garbage-collected mid-flight).
         self._retired: set[Upstream] = set()
         self._closing: set[asyncio.Task] = set()
-        # Real slot occupancy from llama.cpp's /slots, vLLM's /load or TensorFold's
-        # /health, when available. Used to spot drift between what we think is
-        # running and what actually is.
+        # Real slot occupancy from llama.cpp's /slots, vLLM's /load, SGLang's
+        # /v1/loads or TensorFold's /health, when available. Used to spot drift
+        # between what we think is running and what actually is.
         self.observed_busy: dict[str, int | None] = {b.name: None for b in config.backends}
-        # The stream count a capacity warning was last given for, so a probe every
-        # few seconds says it once rather than every time.
+        # The limit a capacity warning was last given for, so a probe every few
+        # seconds says it once rather than every time.
         self._warned_capacity: dict[str, int] = {}
         # Usable context per backend, from config or discovered upstream.
         self.context_length: dict[str, int | None] = {
@@ -449,14 +449,48 @@ class BackendClients:
         except (httpx.HTTPError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
             return None
 
+    def _parse_sglang_loads(self, backend: BackendConfig, payload: Any) -> int | None:
+        """SGLang: /v1/loads -> {"loads": [one entry per data-parallel rank]}.
+
+        Everything the router sent it is either running or waiting in its own
+        queue, so both count. max_running_requests is how many it runs at once,
+        summed over the ranks.
+        """
+        loads = payload.get("loads") if isinstance(payload, dict) else None
+        if not isinstance(loads, list) or not loads:
+            return None
+
+        def count(entry: Any, key: str) -> int | None:
+            value = entry.get(key) if isinstance(entry, dict) else None
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        busy = 0
+        for entry in loads:
+            running, waiting = count(entry, "num_running_reqs"), count(entry, "num_waiting_reqs")
+            if running is None:
+                return None
+            busy += running + (waiting or 0)
+
+        limits = [count(entry, "max_running_requests") for entry in loads]
+        if all(limits) and 0 < (most := sum(limits)) < backend.capacity:
+            if self._warned_capacity.get(backend.name) != most:
+                self._warned_capacity[backend.name] = most
+                log.warning(
+                    "backend %s runs %d requests at once but is configured with capacity "
+                    "%d; lower capacity to match its --max-running-requests",
+                    backend.name, most, backend.capacity,
+                )
+        return busy
+
     async def _probe_load(
         self, backend: BackendConfig, scheduler: Scheduler, timeout: float
     ) -> None:
         """Ask a backend what *it* thinks it is running, and compare with our count.
 
-        Only llama.cpp (/slots), vLLM (/load) and TensorFold (/health) publish this. A backend reporting
-        more work than we dispatched means something else is sharing the host, which
-        silently invalidates our capacity gate -- worth saying out loud.
+        Only llama.cpp (/slots), vLLM (/load), SGLang (/v1/loads) and TensorFold
+        (/health) publish this. A backend reporting more work than we dispatched
+        means something else is sharing the host, which silently invalidates our
+        capacity gate -- worth saying out loud.
         """
         path = backend.load_path
         if path is None:
@@ -505,6 +539,9 @@ class BackendClients:
             return sum(
                 1 for s in payload if isinstance(s, dict) and s.get("is_processing")
             )
+
+        if backend.kind == "sglang":
+            return self._parse_sglang_loads(backend, payload)
 
         if backend.kind == "tensorfold":
             # /health: requests_running counts requests holding a stream, not the

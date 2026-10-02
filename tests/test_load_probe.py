@@ -127,3 +127,24 @@ async def test_tensorfold_capacity_above_its_parallel_is_warned_about_once(caplo
             pass
     warnings = [r for r in caplog.records if "decodes 2 requests at once" in r.getMessage()]
     assert len(warnings) == 1
+
+
+async def test_sglang_loads_are_summed_over_its_ranks():
+    """/v1/loads reports each data-parallel rank; the router sent to all of them."""
+    upstream = FakeUpstream(name="s", model="m", kind="sglang", max_concurrency=8,
+                            context_length=8192, dp_ranks=2)
+    upstream.active = 3
+    upstream.foreign_running = 2
+    async with probed(upstream) as (clients, scheduler):
+        assert clients.observed_busy["s"] == 5
+        assert scheduler.backends["s"].healthy is True
+
+
+async def test_sglang_capacity_above_its_max_running_requests_is_warned_about_once(caplog):
+    upstream = FakeUpstream(name="s", model="m", kind="sglang", max_concurrency=8,
+                            context_length=8192, dp_ranks=2, max_running=2)
+    with caplog.at_level("WARNING"):
+        async with probed(upstream):
+            pass
+    warnings = [r for r in caplog.records if "runs 4 requests at once" in r.getMessage()]
+    assert len(warnings) == 1

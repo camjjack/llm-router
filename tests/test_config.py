@@ -53,7 +53,7 @@ backends:
         ("backends:\n  - {name: a, url: h, capacity: 0, models: [m]}", "capacity must be"),
         ("backends:\n  - {name: a, url: h, capacity: 999, models: [m]}", "exceeds"),
         ("backends:\n  - {name: a, url: h, capacity: 1, models: []}", "non-empty list"),
-        ("backends:\n  - {name: a, url: h, capacity: 1, models: [m], kind: sglang}", "kind must be"),
+        ("backends:\n  - {name: a, url: h, capacity: 1, models: [m], kind: warpdrive}", "kind must be"),
         # vLLM gets a higher ceiling, but not an unlimited one.
         ("backends:\n  - {name: a, url: h, capacity: 99999, models: [m], kind: vllm}", "exceeds"),
         (

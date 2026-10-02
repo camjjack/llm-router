@@ -54,6 +54,8 @@ class BackendStats:
     tokens_per_s: deque[float] = field(default_factory=lambda: deque(maxlen=64))
     # Per-request cache hit ratios, so a few huge prompts cannot dominate the average.
     cache_ratios: deque[float] = field(default_factory=lambda: deque(maxlen=64))
+    # It has reported a cached-token count at least once, so it reports them.
+    reports_cache: bool = False
 
     def record_usage(self, usage: "TokenUsage | None") -> None:
         """Absorb one request's token counts, tolerating missing or odd values.
@@ -78,6 +80,7 @@ class BackendStats:
         # recording a zero this request gives no evidence for.
         if not isinstance(cached, int) or isinstance(cached, bool) or cached < 0:
             return
+        self.reports_cache = True
         # Guard against a backend reporting more cached than prompt tokens.
         cached = min(cached, prompt)
         self.cached_tokens += cached

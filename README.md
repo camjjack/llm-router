@@ -10,7 +10,8 @@ A load-balancing proxy for local LLM backends that does two things ordinary rout
 
 Speaks both the **OpenAI chat-completions** API and the **Anthropic Messages** API, so opencode and
 Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.cpp**, **vLLM**,
-**LM Studio** and **TensorFold** backends, including a mix of engines serving the same model.
+**SGLang**, **LM Studio** and **TensorFold** backends, including a mix of engines serving the same
+model.
 
 | Endpoint | For |
 |---|---|
@@ -26,6 +27,7 @@ Claude Code can point at the same router. Routes to **ninfer-windows**, **llama.
 | `ninfer` | `/health` | none | `/v1/models` `max_model_len` | `--max-concurrency` |
 | `llamacpp` | `/health` | `/slots` | `/props` `n_ctx` (per slot) | `-np` / `--parallel` |
 | `vllm` | `/health` | `/load` † | `/v1/models` `max_model_len` | `--max-num-seqs` |
+| `sglang` | `/health` | `/v1/loads` | `/v1/models` `max_model_len` | `--max-running-requests` |
 | `lmstudio` | `/api/v0/models` ‡ | none | `/api/v0/models` `loaded_context_length` | parallel-requests setting |
 | `tensorfold` | `/health` | `/health` `requests_running` | `/tokenize` `max_model_len` § | `--parallel` |
 | `openai` | `/health` | none | `/v1/models` | whatever the endpoint allows |
@@ -555,6 +557,26 @@ usage entirely, on both the OpenAI and the Anthropic surface, so the dashboard's
 log line carries `Prefix cache hit rate`, and `curl http://host:8000/metrics | grep prefix_cache` has
 the counters — so check there if the column stays empty after adding it. Some vLLM versions have bugs
 that keep the field null regardless.
+
+**SGLang** — like vLLM, it batches continuously and queues without head-of-line blocking, so set
+`capacity` to `--max-running-requests` rather than gating it low; the router warns if `capacity` is
+higher than `/v1/loads` says it runs. `/v1/loads` reports every data-parallel rank's running and
+waiting requests, and the router cross-checks its in-flight count against their sum, with no flag
+needed. It serves the Anthropic Messages API too, so Claude Code can use it.
+
+Start it with **`--enable-cache-report`**, or it reports no cached-token counts and the `cache`
+column shows `--`. With it, SGLang still leaves the count out whenever nothing was cached, on both
+surfaces, where vLLM sends a zero. The router normally reads a missing count as "not reported",
+which here would drop every miss and leave a hit rate counting only hits. So once an SGLang backend
+has reported a count, a missing one counts as a miss; until its first hit, nothing is counted.
+
+```yaml
+  - name: sglang-1
+    url: http://10.0.0.60:30000
+    kind: sglang
+    capacity: 128            # --max-running-requests
+    models: [qwen3.6-27b]
+```
 
 **LM Studio** — `capacity` must match the parallel-request setting in its server UI (it serialises by
 default, in which case use `1`). Newer builds want an auth token; set `api_key: "${LM_API_TOKEN}"`.

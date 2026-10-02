@@ -71,7 +71,8 @@ class FakeUpstream:
     # none), and the --parallel its /health reports (None: no streams section).
     tokenize_available: bool = True
     parallel: int | None = None
-    # Requests running that some other client sent, not the router.
+    # Requests running that some other client sent, not the router (TensorFold's
+    # /health and SGLang's /v1/loads report them).
     foreign_running: int = 0
 
     active: int = 0
@@ -97,6 +98,10 @@ class FakeUpstream:
     # started with --enable-prompt-tokens-details, and that silence must not be
     # read as "nothing was cached".
     report_cache: bool = True
+    # SGLang only: data-parallel ranks /v1/loads reports, and its
+    # max_running_requests (per rank; default max_concurrency).
+    dp_ranks: int = 1
+    max_running: int | None = None
 
     _port: int = 0
     _server: uvicorn.Server | None = None
@@ -117,6 +122,7 @@ class FakeUpstream:
                 Route("/load", self._load, methods=["GET"]),
                 Route("/v1/models", self._models, methods=["GET"]),
                 Route("/tokenize", self._tokenize, methods=["POST"]),
+                Route("/v1/loads", self._loads, methods=["GET"]),
                 Route("/api/v0/models", self._lmstudio_models, methods=["GET"]),
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
                 Route("/v1/messages", self._messages, methods=["POST"]),
@@ -195,6 +201,20 @@ class FakeUpstream:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse({"server_load": self.active})
 
+    async def _loads(self, request: Request) -> JSONResponse:
+        if self.kind != "sglang":
+            return JSONResponse({"error": "not found"}, status_code=404)
+        running = self.active + self.foreign_running
+        per_rank = self.max_running if self.max_running is not None else self.max_concurrency
+        # Spread over the ranks, the first taking any remainder.
+        loads = [
+            {"dp_rank": rank,
+             "num_running_reqs": running // self.dp_ranks + (running % self.dp_ranks if rank == 0 else 0),
+             "num_waiting_reqs": 0, "max_running_requests": per_rank, "token_usage": 0.0}
+            for rank in range(self.dp_ranks)
+        ]
+        return JSONResponse({"timestamp": "", "version": "fake", "loads": loads})
+
     async def _lmstudio_models(self, request: Request) -> JSONResponse:
         if self.kind != "lmstudio":
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -249,6 +269,12 @@ class FakeUpstream:
         if not self.report_cache:
             # No cache fields at all, so input_tokens is the whole prompt.
             return {"input_tokens": fresh + cached, "output_tokens": output}
+        if self.kind == "sglang":
+            # Only a hit is reported; a miss is said by leaving the field out.
+            usage = {"input_tokens": fresh, "output_tokens": output}
+            if cached:
+                usage["cache_read_input_tokens"] = cached
+            return usage
         return {
             "input_tokens": fresh,
             "cache_read_input_tokens": cached,
@@ -394,7 +420,8 @@ class FakeUpstream:
             "completion_tokens": self.chunks,
             "total_tokens": prompt_tokens + self.chunks,
         }
-        if self.report_cache:
+        # SGLang leaves the details out when nothing was cached.
+        if self.report_cache and (cached or self.kind != "sglang"):
             usage["prompt_tokens_details"] = {"cached_tokens": cached}
 
         if body.get("stream"):
