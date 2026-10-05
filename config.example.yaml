@@ -150,6 +150,17 @@ backends:
     capacity: 256
     models: [qwen3.6-27b]
 
+  # --- SGLang ----------------------------------------------------------------
+  # Batches continuously like vLLM: capacity = --max-running-requests, not low.
+  # Context comes from /v1/models max_model_len; load from /v1/loads, summed over
+  # its data-parallel ranks. Start it with --enable-cache-report, or the cache
+  # column stays empty.
+  # - name: sglang-1
+  #   url: http://10.0.0.60:30000
+  #   kind: sglang
+  #   capacity: 128
+  #   models: [qwen3.6-27b]
+
   # --- TensorFold ------------------------------------------------------------
   # capacity must equal --parallel: a request past it waits inside TensorFold,
   # out of the router's sight. The router warns if /health says otherwise, and

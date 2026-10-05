@@ -15,13 +15,15 @@ from .tracking import DEFAULT_USER_HEADERS
 
 # Backend engines we know how to probe. They differ in where they publish context
 # length and load, and in whether they want to be saturated -- see BackendConfig.
-KINDS = ("ninfer", "llamacpp", "vllm", "lmstudio", "tensorfold", "openai")
+KINDS = ("ninfer", "llamacpp", "vllm", "sglang", "lmstudio", "tensorfold", "openai")
 
 # ninfer caps --max-concurrency at 8, llama.cpp slots are bounded by -np, LM Studio
-# by its parallel-requests setting. vLLM's --max-num-seqs defaults to 256, so it is
-# allowed a much higher ceiling.
+# by its parallel-requests setting. vLLM's --max-num-seqs defaults to 256, and
+# SGLang's --max-running-requests is sized from its memory, so both are allowed a
+# much higher ceiling.
 SANE_CAPACITY_LIMIT = 64
 VLLM_CAPACITY_LIMIT = 1024
+CONTINUOUS_BATCHING = ("vllm", "sglang")
 
 
 class ConfigError(ValueError):
@@ -70,16 +72,18 @@ class BackendConfig:
             return "/load"  # requires --enable-server-load-tracking
         if self.kind == "tensorfold":
             return "/health"  # requests_running, beside the liveness fields
+        if self.kind == "sglang":
+            return "/v1/loads?include=core"  # per data-parallel rank; always on
         return None
 
     @property
     def batches_continuously(self) -> bool:
         """True for engines that want to be saturated rather than trickle-fed.
 
-        vLLM schedules a continuous batch and queues internally without head-of-line
-        blocking, so gating it to a small capacity wastes throughput.
+        vLLM and SGLang schedule a continuous batch and queue internally without
+        head-of-line blocking, so gating either to a small capacity wastes throughput.
         """
-        return self.kind == "vllm"
+        return self.kind in CONTINUOUS_BATCHING
 
 
 @dataclass(frozen=True)
@@ -300,12 +304,13 @@ def _parse_backend(raw: Any, index: int) -> BackendConfig:
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
         raise ConfigError(f"backend '{name}': capacity must be an integer >= 1")
     kind_hint = str(raw.get("kind", "ninfer"))
-    limit = VLLM_CAPACITY_LIMIT if kind_hint == "vllm" else SANE_CAPACITY_LIMIT
+    limit = VLLM_CAPACITY_LIMIT if kind_hint in CONTINUOUS_BATCHING else SANE_CAPACITY_LIMIT
     if capacity > limit:
         raise ConfigError(
             f"backend '{name}': capacity {capacity} exceeds {limit}; this should match "
             "the host's --max-concurrency (ninfer), -np (llama.cpp), --max-num-seqs "
-            "(vLLM), or parallel-request setting (LM Studio)"
+            "(vLLM), --max-running-requests (SGLang), or parallel-request setting "
+            "(LM Studio)"
         )
 
     models = raw["models"]

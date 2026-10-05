@@ -254,3 +254,10 @@ async def test_tensorfold_without_tokenize_leaves_the_context_unknown():
             assert router.context_for("m") is None
     finally:
         await upstream.stop()
+
+
+async def test_sglang_context_from_max_model_len():
+    upstream = FakeUpstream(name="s", model="m", kind="sglang", context_length=262144,
+                            max_concurrency=128)
+    async with stack([upstream]) as (client, router):
+        assert router.clients.context_length["s"] == 262144

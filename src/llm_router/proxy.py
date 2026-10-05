@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import time
@@ -28,7 +29,7 @@ from .scheduler import (
     QueueTimeout,
     Scheduler,
 )
-from .stats import RouterStats
+from .stats import BackendStats, RouterStats, TokenUsage
 from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface
 from .tracking import CANCELLED, ERROR, OK, SessionTracker, Tracked
 
@@ -681,7 +682,7 @@ class Router:
             data = upstream.json()
         except ValueError:
             data = None
-        usage = surface.usage_from_body(data)
+        usage = _misses_counted(lease.backend, bstats, surface.usage_from_body(data))
         tracked.usage = usage
         if usage is not None:
             bstats.record_usage(usage)
@@ -800,7 +801,7 @@ class Router:
                 bstats.errors += 1
             else:
                 bstats.completed += 1
-            usage = tap.usage
+            usage = _misses_counted(lease.backend, bstats, tap.usage)
             if usage is not None:
                 bstats.record_usage(usage)
                 if usage.completion_tokens > 0 and first_byte_at is not None:
@@ -1045,6 +1046,28 @@ class Router:
 
 def _rounded(value: float | None, digits: int) -> float | None:
     return None if value is None else round(value, digits)
+
+
+def _misses_counted(
+    state: BackendState, bstats: BackendStats, usage: TokenUsage | None
+) -> TokenUsage | None:
+    """A cache miss where SGLang reported it by saying nothing.
+
+    Missing cached-token counts normally mean a backend doesn't report them
+    (vLLM without --enable-prompt-tokens-details), and are left unknown rather
+    than read as misses. SGLang with --enable-cache-report reports them, but
+    leaves the field out whenever nothing was cached, on both surfaces. Read as
+    unknown, every miss would drop out and the hit rate would count only hits.
+    Once it has reported a count, so is known to report them, silence is zero.
+    """
+    if (
+        usage is not None
+        and usage.cached_tokens is None
+        and state.config.kind == "sglang"
+        and bstats.reports_cache
+    ):
+        return dataclasses.replace(usage, cached_tokens=0)
+    return usage
 
 
 def create_app(

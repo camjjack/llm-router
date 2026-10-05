@@ -215,3 +215,60 @@ def test_the_word_error_in_a_reply_is_not_an_error():
                   {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}}))
     assert tap.error is None
     assert tap.usage.completion_tokens == 2
+
+
+# -------------------------------------------- SGLang: a miss said by silence
+
+
+def chat(system: str, stream: bool = False) -> dict:
+    body = {"model": MODEL, "messages": [{"role": "system", "content": system},
+                                         {"role": "user", "content": "go"}]}
+    return body | ({"stream": True, "stream_options": {"include_usage": True}} if stream else {})
+
+
+async def test_sglang_misses_count_once_it_has_reported_a_hit():
+    """SGLang leaves cached_tokens out when nothing was cached. Left unknown,
+    every miss would drop out of the rate and only hits would count."""
+    upstream = FakeUpstream(name="s", model=MODEL, kind="sglang", latency_s=0.01)
+    async with router_for(upstream) as (client, router):
+        # A miss before it has ever reported: nothing yet says it reports at all.
+        await client.post("/v1/chat/completions", json=chat("one"))
+        stats = router.stats.backend("s")
+        assert list(stats.cache_ratios) == []
+        # The same prompt again: a hit, which shows it reports.
+        await client.post("/v1/chat/completions", json=chat("one"))
+        # A new system prompt, streamed: a miss, now counted as one.
+        async with client.stream("POST", "/v1/chat/completions", json=chat("two", stream=True)) as r:
+            async for _ in r.aiter_bytes():
+                pass
+        assert len(stats.cache_ratios) == 2
+        assert stats.cache_ratios[0] > 0 and stats.cache_ratios[1] == 0
+
+
+async def test_sglang_misses_count_on_the_anthropic_surface_too():
+    upstream = FakeUpstream(name="s", model=MODEL, kind="sglang", latency_s=0.01)
+
+    def message(opening: str) -> dict:
+        return {"model": MODEL, "max_tokens": 16,
+                "messages": [{"role": "user", "content": opening}]}
+
+    async with router_for(upstream) as (client, router):
+        for opening in ("one", "one", "two"):
+            assert (await client.post("/v1/messages", json=message(opening))).status_code == 200
+        ratios = list(router.stats.backend("s").cache_ratios)
+        assert len(ratios) == 2 and ratios[0] > 0 and ratios[1] == 0
+
+
+def test_only_sglang_has_its_silence_read_as_a_miss():
+    from types import SimpleNamespace
+
+    from llm_router.proxy import _misses_counted
+
+    silent = TokenUsage(prompt_tokens=10, completion_tokens=2)
+    reporting = BackendStats(name="b", reports_cache=True)
+    for kind, expected in (("sglang", 0), ("vllm", None), ("ninfer", None)):
+        state = SimpleNamespace(config=SimpleNamespace(kind=kind))
+        assert _misses_counted(state, reporting, silent).cached_tokens == expected
+    # Not before it has shown it reports at all.
+    state = SimpleNamespace(config=SimpleNamespace(kind="sglang"))
+    assert _misses_counted(state, BackendStats(name="b"), silent).cached_tokens is None
