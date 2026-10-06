@@ -426,7 +426,10 @@ turned up more than the documentation did:
   running it. Effort is its *thinking level*: each effort level it has a name for becomes one, the
   configured effort is where sessions start, and Shift+Tab or `--thinking` switches. Other
   `request_params` go in `compat.extraBody`, which it lays over every request, so an effort it has
-  no level for (such as `none`) stays there and pins the effort instead. `models.yml` can't assign
+  no level for (such as `none`) stays there and pins the effort instead. For a model it takes for
+  Qwen 3.8 or later, omp switches thinking on with `enable_thinking` and sends the level only when
+  told the template takes one, which it assumes only for LM Studio and vLLM; the generated config
+  says so (`qwenTemplateReasoningEffort`), or every level would run at the template's xhigh. `models.yml` can't assign
   roles, so `/clients/oh-my-pi?format=config` serves the `modelRoles` lines for
   `~/.omp/agent/config.yml`. They include `slow` and `plan` even when those only follow the
   default: omp's own fallback for an unset role is a list of cloud models, which it would use first
