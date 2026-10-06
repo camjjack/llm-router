@@ -843,7 +843,7 @@ uv run pytest -q
 ## Building a wheel
 
 ```bash
-uv build          # -> dist/llm_router-0.4.0-py3-none-any.whl
+uv build          # -> dist/llm_router-0.4.1-py3-none-any.whl
 ```
 
 CI (`.github/workflows/build.yml`) builds on **ubuntu-24.04 using the system Python 3.12** — no
@@ -868,11 +868,11 @@ For a link anyone can `curl`, push a version tag. That runs the release job, whi
 wheel and sdist to a GitHub Release, and **release assets are anonymous-downloadable**:
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.4.1 && git push origin v0.4.1
 ```
 
 ```bash
-pip install https://github.com/camjjack/llm-router/releases/download/v0.4.0/llm_router-0.4.0-py3-none-any.whl
+pip install https://github.com/camjjack/llm-router/releases/download/v0.4.1/llm_router-0.4.1-py3-none-any.whl
 ```
 
 The release step is idempotent: re-running a tag build repairs a partial release rather than failing
