@@ -239,6 +239,31 @@ def stream_error(event: Any) -> str | None:
     return str(text or "error")[:MAX_ERROR_CHARS]
 
 
+def error_reason(content: bytes) -> str:
+    """Why a backend refused a request, from its error response's body.
+
+    Engines shape these differently: OpenAI's {"error": {"message": ...}},
+    Anthropic's {"type": "error", "error": {...}}, a bare {"error": "..."},
+    FastAPI's {"detail": ...}, or plain text. Whitespace is collapsed and the
+    result bounded, since it goes into the dashboard and the log.
+    """
+    try:
+        parsed: Any = json.loads(content)
+    except (ValueError, UnicodeDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        text = stream_error(parsed)
+        if text is None:
+            detail = parsed.get("detail") or parsed.get("message")
+            text = detail if isinstance(detail, str) else json.dumps(detail) if detail else None
+    else:
+        text = None
+    if text is None:
+        text = content.decode("utf-8", "replace") if content else ""
+    text = " ".join(text.split())
+    return text[:MAX_ERROR_CHARS] or "no reason given"
+
+
 class StreamTap:
     """Observes a pass-through SSE stream to recover its token usage, and any
     error it reports.

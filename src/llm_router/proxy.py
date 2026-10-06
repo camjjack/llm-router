@@ -30,7 +30,7 @@ from .scheduler import (
     Scheduler,
 )
 from .stats import BackendStats, RouterStats, TokenUsage
-from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface
+from .surfaces import ANTHROPIC, OPENAI, StreamTap, Surface, error_reason
 from .tracking import CANCELLED, ERROR, OK, SessionTracker, Tracked
 
 log = logging.getLogger("llm_router.proxy")
@@ -277,13 +277,15 @@ class Router:
         try:
             body = await request.json()
         except (ValueError, UnicodeDecodeError):
-            return surface.error(400, "request body must be valid JSON", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "request body must be valid JSON",
+                                surfaces.BAD_REQUEST)
         if not isinstance(body, dict):
-            return surface.error(400, "request body must be a JSON object", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "request body must be a JSON object",
+                                surfaces.BAD_REQUEST)
 
         requested = body.get("model")
         if not isinstance(requested, str) or not requested:
-            return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "'model' is required", surfaces.BAD_REQUEST)
 
         # Read once: a reload may swap self.config while this request waits, and
         # one request should not mix settings from two generations.
@@ -360,11 +362,11 @@ class Router:
         model = self.resolve_model(requested)
         if not config.backends_for(model):
             tracked.note = "unknown model"
-            return surface.error(
-                404,
+            return self._refuse(
+                surface, request, 404,
                 f"model '{requested}' is not served by any configured backend "
                 f"(known: {', '.join(config.all_models)})",
-                surfaces.MODEL_NOT_FOUND,
+                surfaces.MODEL_NOT_FOUND, tracked,
             )
         self._note_requested(requested)
 
@@ -428,18 +430,18 @@ class Router:
                     return last_error
                 self.stats.rejected_no_backend += 1
                 tracked.note = "no healthy backend"
-                return surface.error(
-                    503,
+                return self._refuse(
+                    surface, request, 503,
                     f"no healthy backend available for model '{model}'",
-                    surfaces.NO_BACKEND,
+                    surfaces.NO_BACKEND, tracked,
                 )
             except QueueTimeout:
                 self.stats.queue_timeouts += 1
                 tracked.note = "queue timeout"
-                return surface.error(
-                    503,
+                return self._refuse(
+                    surface, request, 503,
                     f"timed out waiting {routing.queue_timeout_s:.0f}s for a free slot",
-                    surfaces.QUEUE_TIMEOUT,
+                    surfaces.QUEUE_TIMEOUT, tracked,
                 )
 
             if self.scheduler.backends.get(lease.name) is not lease.backend:
@@ -449,8 +451,10 @@ class Router:
                 if reroutes:
                     reroutes -= 1
                     continue
-                return surface.error(
-                    503, "backend was reconfigured; retry", surfaces.NO_BACKEND
+                tracked.note = "backend was reconfigured"
+                return self._refuse(
+                    surface, request, 503, "backend was reconfigured; retry",
+                    surfaces.NO_BACKEND, tracked,
                 )
 
             self._record_lease(lease, pinned=preferred is not None)
@@ -475,7 +479,11 @@ class Router:
             preferred = None
             failures += 1
 
-        return last_error or surface.error(502, "all backends failed", surfaces.ALL_FAILED)
+        if last_error is not None:
+            return last_error  # each failure was logged as it happened
+        tracked.note = "all backends failed"
+        return self._refuse(surface, request, 502, "all backends failed", surfaces.ALL_FAILED,
+                            tracked)
 
     async def count_tokens(self, request: Request) -> Response:
         """Anthropic token counting.
@@ -489,20 +497,22 @@ class Router:
         try:
             body = await request.json()
         except (ValueError, UnicodeDecodeError):
-            return surface.error(400, "request body must be valid JSON", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "request body must be valid JSON",
+                                surfaces.BAD_REQUEST)
         if not isinstance(body, dict):
-            return surface.error(400, "request body must be a JSON object", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "request body must be a JSON object",
+                                surfaces.BAD_REQUEST)
 
         requested = body.get("model")
         if not isinstance(requested, str) or not requested:
-            return surface.error(400, "'model' is required", surfaces.BAD_REQUEST)
+            return self._refuse(surface, request, 400, "'model' is required", surfaces.BAD_REQUEST)
         model = self.resolve_model(requested)
 
         states = [self.scheduler.backends.get(b.name) for b in self.config.backends_for(model)]
         candidates = [s for s in states if s is not None and s.healthy]
         if not candidates:
-            return surface.error(
-                503,
+            return self._refuse(
+                surface, request, 503,
                 f"no healthy backend available for model '{model}'",
                 surfaces.NO_BACKEND,
             )
@@ -532,10 +542,15 @@ class Router:
                     timeout=self.clients.request_timeout(),
                 )
         except (httpx.HTTPError, OSError) as exc:
-            return surface.error(
-                502,
+            return self._refuse(
+                surface, request, 502,
                 f"backend '{backend.name}' unreachable: {exc}",
                 surfaces.UNREACHABLE,
+            )
+        if upstream.status_code >= 400:
+            log.warning(
+                "backend %s answered %d to %s's token count: %s", backend.name,
+                upstream.status_code, _address(request), error_reason(upstream.content),
             )
         return Response(
             content=upstream.content,
@@ -626,6 +641,7 @@ class Router:
             self.scheduler.note_failure(lease.backend)
             self.stats.backend(backend.name).errors += 1
             log.warning("backend %s transport error: %r", backend.name, exc)
+            tracked.note = f"backend {backend.name} unreachable: {type(exc).__name__}"
             return (
                 "retry",
                 surface.error(
@@ -667,7 +683,7 @@ class Router:
         if upstream.status_code != 200:
             lease.release()
             return self._upstream_error(
-                lease.backend, upstream.status_code, upstream.content, surface
+                lease.backend, upstream.status_code, upstream.content, surface, tracked
             )
 
         lease.release()
@@ -729,7 +745,9 @@ class Router:
             content = await upstream.aread()
             await upstream.aclose()
             lease.release()
-            return self._upstream_error(lease.backend, upstream.status_code, content, surface)
+            return self._upstream_error(
+                lease.backend, upstream.status_code, content, surface, tracked
+            )
 
         self.scheduler.note_success(lease.backend)
         if keys:
@@ -814,11 +832,34 @@ class Router:
                 tracked, 200, ERROR if failed else OK if finished else CANCELLED
             )
 
+    def _refuse(
+        self,
+        surface: Surface,
+        request: Request,
+        status: int,
+        message: str,
+        kind: str,
+        tracked: Tracked | None = None,
+    ) -> Response:
+        """Turn a request away with the router's own error, and say so in the log."""
+        who = _who(tracked) if tracked is not None else _address(request)
+        log.warning("refused %s's request with %d: %s", who, status, message)
+        return surface.error(status, message, kind)
+
     def _upstream_error(
-        self, state: BackendState, status: int, content: bytes, surface: Surface
+        self,
+        state: BackendState,
+        status: int,
+        content: bytes,
+        surface: Surface,
+        tracked: Tracked,
     ) -> tuple[str, Response]:
         name = state.name
         bstats = self.stats.backend(name)
+        # The backend's own words, for the dashboard and the log. A request
+        # retried elsewhere keeps the note, but it shows only if it fails.
+        reason = error_reason(content)
+        tracked.note = f"backend {name}: {reason}"
         code = None
         try:
             parsed = json.loads(content)
@@ -844,6 +885,11 @@ class Router:
                 code or "",
             )
         bstats.errors += 1
+        log.warning(
+            "backend %s answered %d to %s's %s request%s: %s",
+            name, status, _who(tracked), tracked.model,
+            "; trying another" if retryable else "", reason,
+        )
         if retryable:
             self.scheduler.note_failure(state)
         else:
@@ -1046,6 +1092,17 @@ class Router:
 
 def _rounded(value: float | None, digits: int) -> float | None:
     return None if value is None else round(value, digits)
+
+
+def _address(request: Request) -> str:
+    client = request.client
+    return client.host if client else "a client"
+
+
+def _who(tracked: Tracked) -> str:
+    """The user the dashboard shows the request under, for the log."""
+    person = tracked.session.person
+    return person.name or tracked.session.address or "a client"
 
 
 def _misses_counted(

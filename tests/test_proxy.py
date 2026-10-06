@@ -418,6 +418,37 @@ async def test_an_error_inside_a_stream_counts_as_an_error():
         assert router.scheduler.backends["a"].healthy is True
 
 
+async def test_a_backend_refusal_says_why(caplog):
+    """A 400 from a backend shows its own reason on the dashboard and in the log,
+    and still reaches the client unchanged."""
+    upstream = FakeUpstream(name="a", max_concurrency=1, model=MODEL, fail_with=400)
+    with caplog.at_level("WARNING"):
+        async with router_stack([upstream]) as (client, router):
+            r = await client.post("/v1/chat/completions", json=turn(1),
+                                  headers={"x-user": "dana"})
+            assert r.status_code == 400
+            assert r.json()["error"]["message"] == "forced failure"
+            [ended] = router.tracker.snapshot()["recent"]
+    assert (ended["state"], ended["status"]) == ("error", 400)
+    assert ended["note"] == "backend a: forced failure"
+    [line] = [r.getMessage() for r in caplog.records if "answered 400" in r.getMessage()]
+    assert line == f"backend a answered 400 to dana's {MODEL} request: forced failure"
+
+
+async def test_the_routers_own_refusals_are_logged(caplog):
+    upstream = FakeUpstream(name="a", max_concurrency=1, model=MODEL)
+    with caplog.at_level("WARNING"):
+        async with router_stack([upstream]) as (client, router):
+            bad = await client.post("/v1/chat/completions", content=b"{not json",
+                                    headers={"content-type": "application/json"})
+            unknown = await client.post("/v1/chat/completions",
+                                        json=turn(1) | {"model": "nope"})
+    assert (bad.status_code, unknown.status_code) == (400, 404)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("refused")]
+    assert any("with 400: request body must be valid JSON" in line for line in lines)
+    assert any("with 404: model 'nope' is not served" in line for line in lines)
+
+
 # -------------------------------------------------------------------- failover
 
 

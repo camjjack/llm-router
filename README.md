@@ -644,7 +644,11 @@ their sessions is doing right now, and anything that has stopped getting answers
   sessions.
 - **Sessions**: the conversations themselves. Expand one to see its last few requests: which
   subagent sent each, where it ran, how long it queued, time to first token, and tokens used.
-- **Recent requests**: the last 50 to finish, which can be filtered to errors only.
+- **Recent requests**: the last 50 to finish, which can be filtered to errors only. A failed request
+  says why: a backend's refusal in its own words (`400 backend ninfer-qwen: prompt is too long`),
+  or the router's (`queue timeout`, `unknown model`). Every failure is also logged as a warning,
+  naming the backend, the user and the reason, as are requests refused before they could be
+  tracked, such as a body that isn't JSON.
 
 Each request also shows **what it asked the model for** — reasoning effort, thinking and its
 budget, and the output limit — and **how long it held a backend**, with how much of that other
