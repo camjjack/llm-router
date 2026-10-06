@@ -17,7 +17,7 @@ from fake_upstream import FakeUpstream
 from llm_router.config import BackendConfig, Config, HealthConfig
 from llm_router.proxy import Router, create_app
 from llm_router.stats import BackendStats, TokenUsage
-from llm_router.surfaces import ANTHROPIC, OPENAI, StreamTap
+from llm_router.surfaces import ANTHROPIC, OPENAI, StreamTap, error_reason
 
 MODEL = "test-model"
 
@@ -272,3 +272,19 @@ def test_only_sglang_has_its_silence_read_as_a_miss():
     # Not before it has shown it reports at all.
     state = SimpleNamespace(config=SimpleNamespace(kind="sglang"))
     assert _misses_counted(state, BackendStats(name="b"), silent).cached_tokens is None
+
+
+# ------------------------------------------------- why a backend said no
+
+
+def test_error_reasons_in_every_shape_engines_use():
+    openai = b'{"error": {"message": "prompt is too long", "type": "invalid_request_error"}}'
+    anthropic = b'{"type": "error", "error": {"type": "invalid_request_error", "message": "bad role"}}'
+    assert error_reason(openai) == "prompt is too long"
+    assert error_reason(anthropic) == "bad role"
+    assert error_reason(b'{"error": "model not loaded"}') == "model not loaded"
+    assert error_reason(b'{"detail": "Not Found"}') == "Not Found"
+    assert error_reason(b'{"detail": [{"loc": ["body"], "msg": "field required"}]}').startswith("[{")
+    assert error_reason(b"upstream says\n  no") == "upstream says no"
+    assert error_reason(b"") == "no reason given"
+    assert len(error_reason(b'{"error": {"message": "' + b"x" * 5000 + b'"}}')) == 200

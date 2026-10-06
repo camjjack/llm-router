@@ -288,7 +288,8 @@ tr.detail:hover > td { background: var(--page); }
 :root[data-theme="dark"] .icon.slow { color: var(--warning); }
 
 .result { display: inline-flex; align-items: center; gap: 5px; }
-.result .why { color: var(--ink-2); }
+.result .why { color: var(--ink-2); max-width: 36ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
 
 .silence.slow, .silence.stuck { font-weight: 600; }
 

@@ -222,6 +222,7 @@ def test_oh_my_pi_models_yml():
                     # extraBody would override whichever level was picked.
                     "compat": {
                         "supportsReasoningEffort": True,
+                        "qwenTemplateReasoningEffort": True,
                         "extraBody": {"chat_template_kwargs": {"clear_thinking": True}},
                     },
                 }],
@@ -235,6 +236,20 @@ def test_oh_my_pi_models_yml():
     }}
     # What is served is YAML, which is what omp reads from models.yml.
     assert yaml.safe_load(clients.CLIENTS["oh-my-pi"].render(setup())) == config
+
+
+def test_oh_my_pi_sends_the_level_to_a_qwen_template():
+    """omp switches a Qwen 3.8+ model's thinking on with enable_thinking, and
+    only adds reasoning_effort when told the template takes one: otherwise it
+    always ran at xhigh, whatever level was picked. Found against omp 18.6.1."""
+    text = GLM_CONFIG.replace(GLM, "qwen3.8-27b").replace("reasoning_effort: high", "reasoning_effort: medium")
+    [model] = clients.oh_my_pi(setup(text))["providers"]["glm53"]["models"]
+    assert model["compat"]["qwenTemplateReasoningEffort"] is True
+    assert model["thinking"]["defaultLevel"] == "medium"
+    # Without efforts there is no level to send, and nothing to set.
+    plain = GLM_CONFIG.replace("      reasoning_effort: high\n", "")
+    [model] = clients.oh_my_pi(setup(plain))["providers"]["glm53"]["models"]
+    assert "qwenTemplateReasoningEffort" not in model.get("compat", {})
 
 
 def test_oh_my_pi_thinking_levels_follow_reasoning_efforts():

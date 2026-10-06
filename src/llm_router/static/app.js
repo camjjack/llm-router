@@ -204,8 +204,9 @@
         // A stream that broke mid-flight was a 200: the reason is the useful part.
         ? [r.status >= 400 ? r.status : null, r.note].filter(Boolean).join(" ")
         : r.status && r.status !== 200 ? String(r.status) : "";
+    // A backend's reason can run long; the cell shows its start, the tooltip all of it.
     return el("span", { class: "result" }, icon(RESULT_ICON[r.state]), r.state,
-      why ? el("span", { class: "why" }, why) : null);
+      why ? el("span", { class: "why", title: why }, why) : null);
   }
 
   const VIA_TIP = {

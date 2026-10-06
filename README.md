@@ -426,7 +426,10 @@ turned up more than the documentation did:
   running it. Effort is its *thinking level*: each effort level it has a name for becomes one, the
   configured effort is where sessions start, and Shift+Tab or `--thinking` switches. Other
   `request_params` go in `compat.extraBody`, which it lays over every request, so an effort it has
-  no level for (such as `none`) stays there and pins the effort instead. `models.yml` can't assign
+  no level for (such as `none`) stays there and pins the effort instead. For a model it takes for
+  Qwen 3.8 or later, omp switches thinking on with `enable_thinking` and sends the level only when
+  told the template takes one, which it assumes only for LM Studio and vLLM; the generated config
+  says so (`qwenTemplateReasoningEffort`), or every level would run at the template's xhigh. `models.yml` can't assign
   roles, so `/clients/oh-my-pi?format=config` serves the `modelRoles` lines for
   `~/.omp/agent/config.yml`. They include `slow` and `plan` even when those only follow the
   default: omp's own fallback for an unset role is a list of cloud models, which it would use first
@@ -641,7 +644,11 @@ their sessions is doing right now, and anything that has stopped getting answers
   sessions.
 - **Sessions**: the conversations themselves. Expand one to see its last few requests: which
   subagent sent each, where it ran, how long it queued, time to first token, and tokens used.
-- **Recent requests**: the last 50 to finish, which can be filtered to errors only.
+- **Recent requests**: the last 50 to finish, which can be filtered to errors only. A failed request
+  says why: a backend's refusal in its own words (`400 backend ninfer-qwen: prompt is too long`),
+  or the router's (`queue timeout`, `unknown model`). Every failure is also logged as a warning,
+  naming the backend, the user and the reason, as are requests refused before they could be
+  tracked, such as a body that isn't JSON.
 
 Each request also shows **what it asked the model for** — reasoning effort, thinking and its
 budget, and the output limit — and **how long it held a backend**, with how much of that other
@@ -836,7 +843,7 @@ uv run pytest -q
 ## Building a wheel
 
 ```bash
-uv build          # -> dist/llm_router-0.4.0-py3-none-any.whl
+uv build          # -> dist/llm_router-0.4.1-py3-none-any.whl
 ```
 
 CI (`.github/workflows/build.yml`) builds on **ubuntu-24.04 using the system Python 3.12** — no
@@ -861,11 +868,11 @@ For a link anyone can `curl`, push a version tag. That runs the release job, whi
 wheel and sdist to a GitHub Release, and **release assets are anonymous-downloadable**:
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.4.1 && git push origin v0.4.1
 ```
 
 ```bash
-pip install https://github.com/camjjack/llm-router/releases/download/v0.4.0/llm_router-0.4.0-py3-none-any.whl
+pip install https://github.com/camjjack/llm-router/releases/download/v0.4.1/llm_router-0.4.1-py3-none-any.whl
 ```
 
 The release step is idempotent: re-running a tag build repairs a partial release rather than failing

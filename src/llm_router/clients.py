@@ -695,6 +695,12 @@ def oh_my_pi(setup: Setup) -> dict[str, Any]:
                 thinking["defaultLevel"] = m.effort
             entry["thinking"] = thinking
             compat["supportsReasoningEffort"] = True
+            # For a model omp takes for Qwen 3.8 or later it switches thinking on
+            # with enable_thinking, and sends the level as reasoning_effort only
+            # when this is set -- which it does itself for LM Studio and vLLM, but
+            # not behind a router, so every level would run at the template's
+            # default (xhigh). Other models never read it.
+            compat["qwenTemplateReasoningEffort"] = True
         # extraBody is laid over the finished request, so a reasoning_effort
         # left in it would override whichever level was picked.
         extra = {k: v for k, v in m.request_params.items()
